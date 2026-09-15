@@ -1,0 +1,46 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.build_cache/
+.venv/
+venv/
+
+# Native build products
+*.dll
+*.so
+*.dylib
+*.pdb
+*.lib
+
+# Generated results and downloaded data
+outputs/
+data/
+data/raw/
+data/processed/
+results/
+figures/
+manuscript/
+*.pdf
+*.png
+*.jpg
+*.jpeg
+
+# Editors and operating systems
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*~
+*.swp
+
+# Local credentials and machine-specific configuration
+.env
+.env.*
+!.env.example
+
+# Coverage, profiling, and documentation build products
+.coverage
+coverage.xml
+htmlcov/
+site/
+*.prof
