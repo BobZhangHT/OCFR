@@ -16,6 +16,7 @@ from typing import Any
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from scipy.integrate import quad
 from scipy.stats import gamma
 
 from config import REAL_DATA, RealDataConfig
@@ -202,8 +203,22 @@ def prepare_all(data_dir: Path, *, refresh: bool = False) -> dict[str, Any]:
 
 
 def _dengue_delay(mean_days: float = 3.0, maximum_weeks: int = 3) -> np.ndarray:
-    edges = 7.0 * np.arange(maximum_weeks + 1, dtype=float)
-    values = np.diff(gamma.cdf(edges, a=2.0, scale=mean_days / 2.0))
+    """Weekly lag 0..K under uniform admission time within a report week."""
+    if mean_days <= 0 or maximum_weeks < 0:
+        raise ValueError('mean_days must be positive and maximum_weeks nonnegative')
+    distribution = gamma(a=2.0, scale=mean_days / 2.0)
+    values = []
+    for week_lag in range(maximum_weeks + 1):
+        lower, upper = 7.0 * week_lag, 7.0 * (week_lag + 1)
+        mass = quad(
+            lambda u: distribution.cdf(max(0.0, upper - u))
+            - distribution.cdf(max(0.0, lower - u)),
+            0.0,
+            7.0,
+            epsabs=1e-12,
+        )[0] / 7.0
+        values.append(mass)
+    values = np.asarray(values, dtype=float)
     return values / values.sum()
 
 
@@ -213,8 +228,9 @@ def _two_rate_intervals(
     delay: np.ndarray,
     tau: int,
     observation_start: int,
+    lag_offset: int = 1,
 ) -> dict[str, float | str]:
-    total, post = exposure_components(cases, delay)
+    total, post = exposure_components(cases, delay, lag_offset=lag_offset)
     post_exposure = post[:, tau - 1]
     design = np.column_stack((total - post_exposure, post_exposure))
     active = np.arange(cases.size) >= observation_start
@@ -258,6 +274,7 @@ def monitor_series(
     n_multiplier: int,
     seed: int,
     backend: str = 'c',
+    lag_offset: int = 1,
 ) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame]:
     frame = frame.sort_values('date').reset_index(drop=True)
     cases = frame['cases'].to_numpy(float)
@@ -277,6 +294,7 @@ def monitor_series(
             observation_start=observation_start,
             candidate_start=candidate_start,
             backend=backend,
+            lag_offset=lag_offset,
         )
         threshold = np.inf
         pvalue = np.nan
@@ -330,6 +348,7 @@ def monitor_series(
                 delay,
                 int(alarm_scan.tau_hat),
                 observation_start,
+                lag_offset=lag_offset,
             )
         )
 
@@ -337,6 +356,7 @@ def monitor_series(
         cases, deaths, delay,
         reference_end=max(observation_start + 14, min(28, len(frame) - 2)),
         observation_start=observation_start,
+        lag_offset=lag_offset,
     )
     benchmark_rows = [
         {
@@ -399,6 +419,7 @@ def run_applications(data_dir: Path, output_dir: Path, *, backend: str = 'c') ->
         n_multiplier=REAL_DATA.n_multiplier,
         seed=REAL_DATA.master_seed + len(summaries),
         backend=backend,
+        lag_offset=0,
     )
     summaries.append(summary)
     traces.append(trace)

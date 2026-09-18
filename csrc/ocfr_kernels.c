@@ -173,23 +173,24 @@ OCFR_API int ocfr_finite_support_score(
  * follows the same cohort summation order as the NumPy reference.
  */
 OCFR_API int ocfr_gp_exposure_components(
-    int n, int delay_len, const double *cases, const double *delay,
+    int n, int delay_len, int lag_offset, const double *cases, const double *delay,
     double *total, double *post
 ) {
     const int n_candidates = n - 1;
-    if (!cases || !delay || !total || !post || n < 3 || delay_len <= 0)
+    if (!cases || !delay || !total || !post || n < 3 || delay_len <= 0 ||
+        (lag_offset != 0 && lag_offset != 1))
         return 1;
     for (int s = 0; s < n; ++s) {
         double running = 0.0;
         double *row = post + (size_t)s * (size_t)n_candidates;
         for (int tau = n - 1; tau >= 1; --tau) {
             const int lag = s - tau;
-            if (lag >= 1 && lag <= delay_len)
-                running += cases[tau] * delay[lag - 1];
+            if (lag >= lag_offset && lag < delay_len + lag_offset)
+                running += cases[tau] * delay[lag - lag_offset];
             row[tau - 1] = running;
         }
-        if (s >= 1 && s <= delay_len)
-            running += cases[0] * delay[s - 1];
+        if (s >= lag_offset && s < delay_len + lag_offset)
+            running += cases[0] * delay[s - lag_offset];
         total[s] = running;
     }
     return 0;

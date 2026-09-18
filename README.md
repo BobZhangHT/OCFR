@@ -135,3 +135,7 @@ comparison statistics, figures, and application summaries below `outputs/`.
 This is research software and is not a clinical decision system. Citation
 metadata are provided in `CITATION.cff`; the manuscript DOI or preprint link
 can be added when it becomes available.
+
+## License
+
+OCFR is released under the MIT License. See `LICENSE` for the full terms.

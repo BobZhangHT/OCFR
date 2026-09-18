@@ -51,7 +51,7 @@ class FastKernels:
         self.lib.ocfr_candidate_matrix.restype = ctypes.c_int
         self.lib.ocfr_finite_support_score.argtypes = [ctypes.c_int, ctypes.c_int, _DOUBLE_PTR, _DOUBLE_PTR, _DOUBLE_PTR, _DOUBLE_PTR, _DOUBLE_PTR, ctypes.c_double, ctypes.c_int, _DOUBLE_PTR, _DOUBLE_PTR, _UCHAR_PTR]
         self.lib.ocfr_finite_support_score.restype = ctypes.c_int
-        self.lib.ocfr_gp_exposure_components.argtypes = [ctypes.c_int, ctypes.c_int, _DOUBLE_PTR, _DOUBLE_PTR, _DOUBLE_PTR, _DOUBLE_PTR]
+        self.lib.ocfr_gp_exposure_components.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, _DOUBLE_PTR, _DOUBLE_PTR, _DOUBLE_PTR, _DOUBLE_PTR]
         self.lib.ocfr_gp_exposure_components.restype = ctypes.c_int
         self.lib.ocfr_gp_score_fields.argtypes = [ctypes.c_int, _DOUBLE_PTR, _DOUBLE_PTR, _DOUBLE_PTR, _DOUBLE_PTR, _DOUBLE_PTR, ctypes.c_int, ctypes.c_int, ctypes.c_int, _DOUBLE_PTR, _DOUBLE_PTR, _DOUBLE_PTR, _DOUBLE_PTR, _DOUBLE_PTR, _UCHAR_PTR, ctypes.POINTER(ctypes.c_int)]
         self.lib.ocfr_gp_score_fields.restype = ctypes.c_int
@@ -126,15 +126,17 @@ class FastKernels:
             raise RuntimeError(f'ocfr_finite_support_score failed with code {code}')
         return (q_values, u_values, eligibility.astype(bool))
 
-    def gp_exposure_components(self, cases: np.ndarray, delay: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def gp_exposure_components(self, cases: np.ndarray, delay: np.ndarray, *, lag_offset: int=1) -> tuple[np.ndarray, np.ndarray]:
         """C99 exposure builder for the one-change Gaussian score detector."""
         cases = self._as_double(cases)
         delay = self._as_double(delay)
         if cases.ndim != 1 or cases.size < 3:
             raise ValueError('cases must be a vector with at least three days')
+        if lag_offset not in (0, 1):
+            raise ValueError('lag_offset must be 0 or 1')
         total = np.zeros(cases.size, dtype=np.float64)
         post = np.zeros((cases.size, cases.size - 1), dtype=np.float64)
-        code = self.lib.ocfr_gp_exposure_components(cases.size, delay.size, cases.ctypes.data_as(_DOUBLE_PTR), delay.ctypes.data_as(_DOUBLE_PTR), total.ctypes.data_as(_DOUBLE_PTR), post.ctypes.data_as(_DOUBLE_PTR))
+        code = self.lib.ocfr_gp_exposure_components(cases.size, delay.size, lag_offset, cases.ctypes.data_as(_DOUBLE_PTR), delay.ctypes.data_as(_DOUBLE_PTR), total.ctypes.data_as(_DOUBLE_PTR), post.ctypes.data_as(_DOUBLE_PTR))
         if code != 0:
             raise RuntimeError(f'ocfr_gp_exposure_components failed with code {code}')
         return (total, post)
@@ -1143,7 +1145,7 @@ def _validate_stream(cases: Sequence[float], deaths: Sequence[int | float]) -> t
         raise ValueError('cases and deaths must be finite and non-negative')
     return (np.ascontiguousarray(c), np.ascontiguousarray(d))
 
-def exposure_components(cases: Sequence[float], delay_pmf: Sequence[float]) -> tuple[np.ndarray, np.ndarray]:
+def exposure_components(cases: Sequence[float], delay_pmf: Sequence[float], *, lag_offset: int=1) -> tuple[np.ndarray, np.ndarray]:
     """Return total exposure and all post-candidate exposure columns.
 
     The returned matrix has shape ``(n, n-1)``.  Column ``tau-1`` is
@@ -1154,10 +1156,12 @@ def exposure_components(cases: Sequence[float], delay_pmf: Sequence[float]) -> t
     f = validate_delay_pmf(delay_pmf)
     if c.ndim != 1 or c.size < 3 or np.any(c < 0.0) or (not np.all(np.isfinite(c))):
         raise ValueError('cases must be a finite non-negative one-dimensional array')
+    if lag_offset not in (0, 1):
+        raise ValueError('lag_offset must be 0 or 1')
     n = c.size
     cohort_contribution = np.zeros((n, n), dtype=np.float64)
     for lag_index, probability in enumerate(f):
-        lag = lag_index + 1
+        lag = lag_index + lag_offset
         if lag >= n or probability == 0.0:
             continue
         cohort = np.arange(0, n - lag)
@@ -1178,20 +1182,20 @@ def _fit_score_null_from_exposure(deaths: np.ndarray, exposure: np.ndarray, *, o
     variance = nb_variance(mean, float(fit.phi))
     return NullScoreFit(pi=float(fit.rates[0]), phi=float(fit.phi), exposure=exposure, mean=mean, variance=variance, success=bool(fit.success), status=str(fit.status))
 
-def fit_score_null(cases: Sequence[float], deaths: Sequence[int | float], delay_pmf: Sequence[float], *, observation_start: int=0) -> NullScoreFit:
+def fit_score_null(cases: Sequence[float], deaths: Sequence[int | float], delay_pmf: Sequence[float], *, observation_start: int=0, lag_offset: int=1) -> NullScoreFit:
     """Fit the constant-CFR NB2 null using only the supplied prefix."""
     c, d = _validate_stream(cases, deaths)
     if not isinstance(observation_start, (int, np.integer)) or observation_start < 0 or observation_start >= c.size:
         raise ValueError('observation_start must index the supplied prefix')
-    exposure, _ = exposure_components(c, delay_pmf)
+    exposure, _ = exposure_components(c, delay_pmf, lag_offset=lag_offset)
     return _fit_score_null_from_exposure(d, exposure, observation_start=observation_start)
 
-def _score_scan_python(cases: Sequence[float], deaths: Sequence[int | float], delay_pmf: Sequence[float], *, use_lindeberg_gate: bool=True, observation_start: int=0, candidate_start: int=1) -> ScoreScan:
+def _score_scan_python(cases: Sequence[float], deaths: Sequence[int | float], delay_pmf: Sequence[float], *, use_lindeberg_gate: bool=True, observation_start: int=0, candidate_start: int=1, lag_offset: int=1) -> ScoreScan:
     """Compute the maximal efficient-score scan at one observed prefix."""
     c, d = _validate_stream(cases, deaths)
     if not isinstance(candidate_start, (int, np.integer)) or candidate_start < 1 or candidate_start >= c.size:
         raise ValueError('candidate_start must lie inside the supplied prefix')
-    exposure, post = exposure_components(c, delay_pmf)
+    exposure, post = exposure_components(c, delay_pmf, lag_offset=lag_offset)
     fit = _fit_score_null_from_exposure(d, exposure, observation_start=observation_start)
     empty = np.empty(0, dtype=np.float64)
     if not fit.success:
@@ -1230,13 +1234,13 @@ def _score_scan_python(cases: Sequence[float], deaths: Sequence[int | float], de
     direction = int(np.sign(z[winner]))
     return ScoreScan(candidates=candidates, z=np.ascontiguousarray(z), q=np.ascontiguousarray(q), efficient_information=np.ascontiguousarray(j), max_leverage=np.ascontiguousarray(max_leverage[valid]), influence=np.ascontiguousarray(influence), statistic=float(q[winner]), tau_hat=int(candidates[winner]), direction=direction, null_fit=fit)
 
-def _score_scan_c(cases: Sequence[float], deaths: Sequence[int | float], delay_pmf: Sequence[float], *, use_lindeberg_gate: bool, observation_start: int, candidate_start: int) -> ScoreScan:
+def _score_scan_c(cases: Sequence[float], deaths: Sequence[int | float], delay_pmf: Sequence[float], *, use_lindeberg_gate: bool, observation_start: int, candidate_start: int, lag_offset: int=1) -> ScoreScan:
     """Compute the current score fields with the verified C99 kernel."""
     c, d = _validate_stream(cases, deaths)
     if not isinstance(candidate_start, (int, np.integer)) or candidate_start < 1 or candidate_start >= c.size:
         raise ValueError('candidate_start must lie inside the supplied prefix')
     kernels = FastKernels()
-    exposure, post = kernels.gp_exposure_components(c, validate_delay_pmf(delay_pmf))
+    exposure, post = kernels.gp_exposure_components(c, validate_delay_pmf(delay_pmf), lag_offset=lag_offset)
     fit = _fit_score_null_from_exposure(d, exposure, observation_start=observation_start)
     empty = np.empty(0, dtype=np.float64)
     if not fit.success:
@@ -1251,7 +1255,7 @@ def _score_scan_c(cases: Sequence[float], deaths: Sequence[int | float], delay_p
     winner = int(np.argmax(q))
     return ScoreScan(candidates=np.ascontiguousarray(candidates), z=z, q=q, efficient_information=np.ascontiguousarray(information[valid]), max_leverage=np.ascontiguousarray(max_leverage[valid]), influence=np.ascontiguousarray(influence_all[:, valid]), statistic=float(q[winner]), tau_hat=int(candidates[winner]), direction=int(np.sign(z[winner])), null_fit=fit)
 
-def score_scan(cases: Sequence[float], deaths: Sequence[int | float], delay_pmf: Sequence[float], *, use_lindeberg_gate: bool=True, observation_start: int=0, candidate_start: int=1, backend: str='c') -> ScoreScan:
+def score_scan(cases: Sequence[float], deaths: Sequence[int | float], delay_pmf: Sequence[float], *, use_lindeberg_gate: bool=True, observation_start: int=0, candidate_start: int=1, backend: str='c', lag_offset: int=1) -> ScoreScan:
     """Compute the maximal efficient-score scan on Python or C99.
 
     ``backend='auto'`` prefers the compiled C99 kernels when they are available
@@ -1262,11 +1266,11 @@ def score_scan(cases: Sequence[float], deaths: Sequence[int | float], delay_pmf:
         raise ValueError("backend must be 'auto', 'python', or 'c'")
     if backend in {'auto', 'c'}:
         try:
-            return _score_scan_c(cases, deaths, delay_pmf, use_lindeberg_gate=use_lindeberg_gate, observation_start=observation_start, candidate_start=candidate_start)
+            return _score_scan_c(cases, deaths, delay_pmf, use_lindeberg_gate=use_lindeberg_gate, observation_start=observation_start, candidate_start=candidate_start, lag_offset=lag_offset)
         except (OSError, RuntimeError, AttributeError):
             if backend == 'c':
                 raise
-    return _score_scan_python(cases, deaths, delay_pmf, use_lindeberg_gate=use_lindeberg_gate, observation_start=observation_start, candidate_start=candidate_start)
+    return _score_scan_python(cases, deaths, delay_pmf, use_lindeberg_gate=use_lindeberg_gate, observation_start=observation_start, candidate_start=candidate_start, lag_offset=lag_offset)
 
 def report_day_score_scan(
     aligned_scan: ScoreScan,
@@ -1523,11 +1527,11 @@ class BenchmarkResult:
     estimated_cohort_change_day: int | None
     direction: int
 
-def _delay_median(delay_pmf: Sequence[float]) -> int:
+def _delay_median(delay_pmf: Sequence[float], lag_offset: int=1) -> int:
     probabilities = np.asarray(delay_pmf, dtype=np.float64)
-    return int(np.searchsorted(np.cumsum(probabilities), 0.5) + 1)
+    return int(np.searchsorted(np.cumsum(probabilities), 0.5) + lag_offset)
 
-def _baseline_residuals(cases: np.ndarray, deaths: np.ndarray, delay_pmf: np.ndarray, reference_end: int, observation_start: int=0) -> tuple[np.ndarray, np.ndarray, float, float]:
+def _baseline_residuals(cases: np.ndarray, deaths: np.ndarray, delay_pmf: np.ndarray, reference_end: int, observation_start: int=0, lag_offset: int=1) -> tuple[np.ndarray, np.ndarray, float, float]:
     """Fit a reference null while retaining the complete case history.
 
     ``observation_start`` marks the first outcome used for inference.  Cases
@@ -1542,10 +1546,10 @@ def _baseline_residuals(cases: np.ndarray, deaths: np.ndarray, delay_pmf: np.nda
         raise ValueError('cases and deaths must be one-dimensional equal-length arrays')
     if not isinstance(reference_end, (int, np.integer)) or not isinstance(observation_start, (int, np.integer)) or observation_start < 0 or (observation_start >= reference_end) or (reference_end >= c.size):
         raise ValueError('require 0 <= observation_start < reference_end < stream length')
-    fit = fit_score_null(c[:reference_end], d[:reference_end], delay_pmf, observation_start=int(observation_start))
+    fit = fit_score_null(c[:reference_end], d[:reference_end], delay_pmf, observation_start=int(observation_start), lag_offset=lag_offset)
     if not fit.success:
         raise RuntimeError(f'benchmark reference fit failed: {fit.status}')
-    exposure, _ = exposure_components(c, delay_pmf)
+    exposure, _ = exposure_components(c, delay_pmf, lag_offset=lag_offset)
     mean = np.maximum(fit.pi * exposure, MU_FLOOR)
     variance = nb_variance(mean, fit.phi)
     residuals = (d - mean) / np.sqrt(np.maximum(variance, MU_FLOOR))
@@ -1577,7 +1581,7 @@ def _profile_nb_scale(y: np.ndarray, baseline_mean: np.ndarray, phi: float) -> t
     lr = 2.0 * (nb_loglik(y, gamma * mu, phi) - nb_loglik(y, mu, phi))
     return (gamma, max(0.0, float(lr)))
 
-def nb_surveillance_glr(cases: Sequence[float], deaths: Sequence[int | float], delay_pmf: Sequence[float], *, reference_end: int=28, observation_start: int=0) -> BenchmarkResult:
+def nb_surveillance_glr(cases: Sequence[float], deaths: Sequence[int | float], delay_pmf: Sequence[float], *, reference_end: int=28, observation_start: int=0, lag_offset: int=1) -> BenchmarkResult:
     """Window-unlimited two-sided NB intercept GLR.
 
     This is the count-regression-chart statistic of Höhle and Paul applied to
@@ -1590,7 +1594,7 @@ def nb_surveillance_glr(cases: Sequence[float], deaths: Sequence[int | float], d
     f = np.asarray(delay_pmf, dtype=np.float64)
     if c.shape != d.shape or c.ndim != 1 or c.size <= reference_end:
         raise ValueError('aligned stream longer than reference_end required')
-    _, mean, _, phi = _baseline_residuals(c, d, f, reference_end, observation_start=observation_start)
+    _, mean, _, phi = _baseline_residuals(c, d, f, reference_end, observation_start=observation_start, lag_offset=lag_offset)
     best_statistic = -np.inf
     best_calendar: int | None = None
     best_scale = 1.0
@@ -1600,11 +1604,11 @@ def nb_surveillance_glr(cases: Sequence[float], deaths: Sequence[int | float], d
             best_statistic = statistic
             best_calendar = change
             best_scale = scale
-    lag = _delay_median(f)
+    lag = _delay_median(f, lag_offset)
     cohort = None if best_calendar is None else max(0, best_calendar - lag)
     return BenchmarkResult(method='NB-surveillance-GLR', day=c.size - 1, statistic=float(best_statistic), estimated_calendar_change_day=best_calendar, estimated_cohort_change_day=cohort, direction=int(np.sign(best_scale - 1.0)))
 
-def focus_working_model(cases: Sequence[float], deaths: Sequence[int | float], delay_pmf: Sequence[float], *, reference_end: int=28, observation_start: int=0) -> BenchmarkResult:
+def focus_working_model(cases: Sequence[float], deaths: Sequence[int | float], delay_pmf: Sequence[float], *, reference_end: int=28, observation_start: int=0, lag_offset: int=1) -> BenchmarkResult:
     """Exact Gaussian mean-change GLR statistic on NB Pearson residuals.
 
     The statistic is the one computed by Gaussian FOCuS; this transparent
@@ -1615,24 +1619,24 @@ def focus_working_model(cases: Sequence[float], deaths: Sequence[int | float], d
     c = np.asarray(cases, dtype=np.float64)
     d = np.asarray(deaths, dtype=np.float64)
     f = np.asarray(delay_pmf, dtype=np.float64)
-    residuals, _, _, _ = _baseline_residuals(c, d, f, reference_end, observation_start=observation_start)
+    residuals, _, _, _ = _baseline_residuals(c, d, f, reference_end, observation_start=observation_start, lag_offset=lag_offset)
     monitor = residuals[reference_end:]
     reversed_sum = np.cumsum(monitor[::-1])[::-1]
     lengths = np.arange(monitor.size, 0, -1, dtype=np.float64)
     statistics = np.square(reversed_sum) / lengths
     index = int(np.argmax(statistics))
     calendar = reference_end + index
-    lag = _delay_median(f)
+    lag = _delay_median(f, lag_offset)
     return BenchmarkResult(method='FOCuS-working-model', day=c.size - 1, statistic=float(statistics[index]), estimated_calendar_change_day=calendar, estimated_cohort_change_day=max(0, calendar - lag), direction=int(np.sign(reversed_sum[index])))
 
-def page_cusum(cases: Sequence[float], deaths: Sequence[int | float], delay_pmf: Sequence[float], *, reference_end: int=28, allowance: float=0.5, observation_start: int=0) -> BenchmarkResult:
+def page_cusum(cases: Sequence[float], deaths: Sequence[int | float], delay_pmf: Sequence[float], *, reference_end: int=28, allowance: float=0.5, observation_start: int=0, lag_offset: int=1) -> BenchmarkResult:
     """Two-sided Page-CUSUM based on fitted NB Pearson-score increments."""
     if allowance < 0.0:
         raise ValueError('allowance must be nonnegative')
     c = np.asarray(cases, dtype=np.float64)
     d = np.asarray(deaths, dtype=np.float64)
     f = np.asarray(delay_pmf, dtype=np.float64)
-    residuals, _, _, _ = _baseline_residuals(c, d, f, reference_end, observation_start=observation_start)
+    residuals, _, _, _ = _baseline_residuals(c, d, f, reference_end, observation_start=observation_start, lag_offset=lag_offset)
     positive = 0.0
     negative = 0.0
     positive_start = reference_end
@@ -1663,17 +1667,17 @@ def page_cusum(cases: Sequence[float], deaths: Sequence[int | float], delay_pmf:
         statistic = negative
         best_calendar = negative_start
         best_direction = -1
-    lag = _delay_median(f)
+    lag = _delay_median(f, lag_offset)
     return BenchmarkResult(method='Page-CUSUM', day=c.size - 1, statistic=float(statistic), estimated_calendar_change_day=best_calendar, estimated_cohort_change_day=max(0, best_calendar - lag), direction=best_direction)
 
-def published_benchmark_statistics(cases: Sequence[float], deaths: Sequence[int | float], delay_pmf: Sequence[float], *, reference_end: int=28, observation_start: int=0) -> dict[str, BenchmarkResult]:
+def published_benchmark_statistics(cases: Sequence[float], deaths: Sequence[int | float], delay_pmf: Sequence[float], *, reference_end: int=28, observation_start: int=0, lag_offset: int=1) -> dict[str, BenchmarkResult]:
     """Evaluate all locked comparator statistics on one observed prefix.
 
     The arrays retain the full calendar coordinate system.  ``observation_start``
     excludes pre-observation deaths from the reference fit and monitoring, but
     does not discard pre-observation cases needed by the delay convolution.
     """
-    results = (nb_surveillance_glr(cases, deaths, delay_pmf, reference_end=reference_end, observation_start=observation_start), page_cusum(cases, deaths, delay_pmf, reference_end=reference_end, observation_start=observation_start), focus_working_model(cases, deaths, delay_pmf, reference_end=reference_end, observation_start=observation_start))
+    results = (nb_surveillance_glr(cases, deaths, delay_pmf, reference_end=reference_end, observation_start=observation_start, lag_offset=lag_offset), page_cusum(cases, deaths, delay_pmf, reference_end=reference_end, observation_start=observation_start, lag_offset=lag_offset), focus_working_model(cases, deaths, delay_pmf, reference_end=reference_end, observation_start=observation_start, lag_offset=lag_offset))
     return {result.method: result for result in results}
 
 # Source section: evaluation.py
