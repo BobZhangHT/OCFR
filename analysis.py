@@ -601,8 +601,11 @@ def figure5_comparison(data: pd.DataFrame, output: Path, window: int) -> list[Pa
     # remain visible.  A truncated lower limit previously hid the Typical point
     # (0.015) and nearly clipped the Wave point (0.024).
     axes[0, 0].set_ylim(0.0, max(0.075, null_upper + 0.003))
-    axes[0, 0].legend(ncol=2, fontsize=9.8, loc="upper center",
-                      bbox_to_anchor=(0.5, 1.16))
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(
+        handles, labels, ncol=5, fontsize=9.0, loc="upper center",
+        bbox_to_anchor=(0.5, 1.015), columnspacing=1.15, handletextpad=0.35,
+    )
     axes[0, 0].text(0.98, 0.04, "target .05; grey band .04--.06",
                     transform=axes[0, 0].transAxes, ha="right", va="bottom",
                     fontsize=9.6)
@@ -624,6 +627,7 @@ def figure5_comparison(data: pd.DataFrame, output: Path, window: int) -> list[Pa
             value = float(power_matrix.iloc[row, col])
             axes[0, 1].text(col, row, f"{value:.2f}", ha="center", va="center", fontsize=9.6, color="white" if value > 0.55 else "black")
     _panel(axes[0, 1], "B", "Absolute timely detection")
+    axes[0, 1].grid(False)
     difference = data[data["metric"] == f"paired_P{window}_difference"].sort_values(["scenario", "method"])
     comparators = ["NB-GLR", "Page-CUSUM", "FOCuS"]
     diff_names = [f"OCFR alpha-matched minus {name}" for name in comparators]
@@ -672,6 +676,7 @@ def figure5_comparison(data: pd.DataFrame, output: Path, window: int) -> list[Pa
     axes[1, 1].tick_params(axis="y", labelsize=9.4)
     plt.setp(axes[1, 1].get_xticklabels(), ha="right", rotation_mode="anchor")
     _panel(axes[1, 1], "D", "Cohort-alignment mechanism ablation")
+    axes[1, 1].grid(False)
     return _save(fig, output, "Fig5_size_comparable_comparison")
 
 
