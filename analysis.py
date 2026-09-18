@@ -573,7 +573,9 @@ def figure5_comparison(data: pd.DataFrame, output: Path, window: int) -> list[Pa
     rule.  OCFR-AM is the size-matched OCFR variant used for fair power contrasts
     against the empirically calibrated benchmark procedures.
     """
-    fig, axes = plt.subplots(2, 2, figsize=(7.6, 6.2))
+    # The source canvas and explicit type sizes are chosen so that all labels
+    # remain at least about 8 pt after inclusion at 0.90\textwidth.
+    fig, axes = plt.subplots(2, 2, figsize=(7.2, 6.8))
     absolute = data[data["metric"] == "probability"]
     null = absolute[(absolute["purpose"] == "null") & absolute["comparison"].eq("benchmark")]
     methods = [m for m in METHOD_ORDER if m in set(null["method"])]
@@ -599,27 +601,28 @@ def figure5_comparison(data: pd.DataFrame, output: Path, window: int) -> list[Pa
     # remain visible.  A truncated lower limit previously hid the Typical point
     # (0.015) and nearly clipped the Wave point (0.024).
     axes[0, 0].set_ylim(0.0, max(0.075, null_upper + 0.003))
-    axes[0, 0].legend(ncol=2, fontsize=6.7, loc="upper center",
+    axes[0, 0].legend(ncol=2, fontsize=9.8, loc="upper center",
                       bbox_to_anchor=(0.5, 1.16))
     axes[0, 0].text(0.98, 0.04, "target .05; grey band .04--.06",
                     transform=axes[0, 0].transAxes, ha="right", va="bottom",
-                    fontsize=6.6)
+                    fontsize=9.6)
     _panel(axes[0, 0], "A", "Held-out size before power")
 
     alternative = absolute[(absolute["purpose"] == "alternative") & absolute["comparison"].eq("benchmark")]
     scenarios = sorted(alternative["scenario"].astype(str).unique())
     if set(alternative["method"]) != set(METHOD_ORDER) or not scenarios:
         raise EvidenceError("Fig. 5 benchmark/alternative is incomplete")
-    power_matrix = alternative.pivot(index="method", columns="scenario", values="estimate").reindex(index=METHOD_ORDER, columns=scenarios)
+    power_matrix = alternative.pivot(index="scenario", columns="method", values="estimate").reindex(index=scenarios, columns=METHOD_ORDER)
     image_b = axes[0, 1].imshow(power_matrix.to_numpy(float), vmin=0, vmax=1, cmap="Blues", aspect="auto")
-    axes[0, 1].set_yticks(np.arange(len(METHOD_ORDER)), ["OCFR", "OCFR-AM", "NB-GLR", "Page", "FOCuS"])
-    axes[0, 1].set_xticks(np.arange(len(scenarios)), [_comparison_scenario_label(v) for v in scenarios])
-    axes[0, 1].tick_params(axis="x", labelrotation=32, labelsize=7.5)
+    axes[0, 1].set_yticks(np.arange(len(scenarios)), [_comparison_scenario_label(v) for v in scenarios])
+    axes[0, 1].set_xticks(np.arange(len(METHOD_ORDER)), ["OCFR", "OCFR-AM", "NB-GLR", "Page", "FOCuS"])
+    axes[0, 1].tick_params(axis="x", labelrotation=28, labelsize=9.4)
+    axes[0, 1].tick_params(axis="y", labelsize=9.4)
     plt.setp(axes[0, 1].get_xticklabels(), ha="right", rotation_mode="anchor")
     for row in range(power_matrix.shape[0]):
         for col in range(power_matrix.shape[1]):
             value = float(power_matrix.iloc[row, col])
-            axes[0, 1].text(col, row, f"{value:.2f}", ha="center", va="center", fontsize=6.7, color="white" if value > 0.55 else "black")
+            axes[0, 1].text(col, row, f"{value:.2f}", ha="center", va="center", fontsize=9.6, color="white" if value > 0.55 else "black")
     _panel(axes[0, 1], "B", "Absolute timely detection")
     difference = data[data["metric"] == f"paired_P{window}_difference"].sort_values(["scenario", "method"])
     comparators = ["NB-GLR", "Page-CUSUM", "FOCuS"]
@@ -657,15 +660,16 @@ def figure5_comparison(data: pd.DataFrame, output: Path, window: int) -> list[Pa
     methods = [m for m in ("Aligned", "Unaligned") if m in set(ablation["method"])]
     if len(methods) != 2:
         raise EvidenceError("alignment_ablation requires methods Aligned and Unaligned")
-    ablation_matrix = ablation.pivot(index="method", columns="scenario", values="estimate").reindex(index=methods, columns=scenarios)
+    ablation_matrix = ablation.pivot(index="scenario", columns="method", values="estimate").reindex(index=scenarios, columns=methods)
     image_d = axes[1, 1].imshow(ablation_matrix.to_numpy(float), vmin=0, vmax=1, cmap="Blues", aspect="auto")
-    axes[1, 1].set_yticks(np.arange(len(methods)), methods)
+    axes[1, 1].set_yticks(np.arange(len(scenarios)), [_comparison_scenario_label(v) for v in scenarios])
     for row in range(ablation_matrix.shape[0]):
         for col in range(ablation_matrix.shape[1]):
             value = float(ablation_matrix.iloc[row, col])
-            axes[1, 1].text(col, row, f"{value:.2f}", ha="center", va="center", fontsize=6.7, color="white" if value > 0.55 else "black")
-    axes[1, 1].set_xticks(np.arange(len(scenarios)), [_comparison_scenario_label(v) for v in scenarios])
-    axes[1, 1].tick_params(axis="x", labelrotation=32, labelsize=7.5)
+            axes[1, 1].text(col, row, f"{value:.2f}", ha="center", va="center", fontsize=9.6, color="white" if value > 0.55 else "black")
+    axes[1, 1].set_xticks(np.arange(len(methods)), methods)
+    axes[1, 1].tick_params(axis="x", labelrotation=0, labelsize=9.8)
+    axes[1, 1].tick_params(axis="y", labelsize=9.4)
     plt.setp(axes[1, 1].get_xticklabels(), ha="right", rotation_mode="anchor")
     _panel(axes[1, 1], "D", "Cohort-alignment mechanism ablation")
     return _save(fig, output, "Fig5_size_comparable_comparison")
