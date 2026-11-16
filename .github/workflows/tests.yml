@@ -25,12 +25,17 @@ jobs:
           cache: pip
       - name: Install package and tests
         run: python -m pip install -e ".[test]"
+      - name: Build distribution archives without native compilation
+        run: |
+          python -m pip install build
+          python -m build --outdir dist
       - name: Build native backend
-        run: python -c "import methods; print(methods.build_native())"
+        run: python -c "import methods; print(methods.build_native(force=True)); print(methods.assert_backend_parity())"
       - name: Run tests
         run: python -m pytest
       - name: Check command-line interfaces
         run: |
           python simulation.py --help
-          python analysis.py --help
-          python real_data.py --help
+          ocfr-simulate --help
+          ocfr-analyze --help
+          ocfr-real-data --help

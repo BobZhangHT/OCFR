@@ -11,9 +11,14 @@ venv/
 *.dylib
 *.pdb
 *.lib
+*.o
+*.obj
 
 # Generated results and downloaded data
 outputs/
+downloads/
+.aris/
+archive/
 data/
 data/raw/
 data/processed/
@@ -24,6 +29,16 @@ manuscript/
 *.png
 *.jpg
 *.jpeg
+*.tif
+*.tiff
+*.eps
+*.svg
+*.csv
+*.json
+*.npy
+*.npz
+*.parquet
+*.pkl
 
 # Editors and operating systems
 .DS_Store
@@ -44,3 +59,10 @@ coverage.xml
 htmlcov/
 site/
 *.prof
+
+# Python distribution artifacts
+build/
+dist/
+*.whl
+*.tar.gz
+*.egg-info/

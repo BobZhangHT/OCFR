@@ -19,10 +19,14 @@ import pandas as pd
 from scipy.integrate import quad
 from scipy.stats import gamma
 
-from config import REAL_DATA, RealDataConfig
+from config import REAL_DATA, RealDataConfig, PostAlarmEstimationConfig
 from methods import (
+    GaussianSpendingBoundary, GAUSSIAN_SPENDING_POLICY,
+    LEGACY_GAUSSIAN_POLICY, gaussian_multiplier_bank,
     exposure_components,
     fit_nb_identity,
+    fit_nb_regularized_identity,
+    regularized_parameter_intervals,
     fixed_tau_wald_intervals,
     gamma_delay_pmf,
     make_sampler,
@@ -234,18 +238,35 @@ def _two_rate_intervals(
     post_exposure = post[:, tau - 1]
     design = np.column_stack((total - post_exposure, post_exposure))
     active = np.arange(cases.size) >= observation_start
-    fit = fit_nb_identity(
+    ordinary = fit_nb_identity(
         deaths[active], np.zeros(int(active.sum()), dtype=float), design[active]
     )
+    reporting = PostAlarmEstimationConfig()
+    fit = fit_nb_regularized_identity(
+        deaths[active], np.zeros(int(active.sum()), dtype=float), design[active],
+        precision=reporting.precision, initial_fit=ordinary)
     result: dict[str, float | str] = {
         'pre_cfr': float(fit.rates[0]),
         'post_cfr': float(fit.rates[1]),
         'risk_ratio': float(fit.rates[1] / fit.rates[0]),
         'interval_status': 'not_available',
+        'estimator': reporting.estimator,
+        'estimator_status': fit.status,
+        'estimator_precision': reporting.precision,
+        'interval_covariance': reporting.covariance,
+        'point_valid': bool(fit.success),
+        'mle_pre_cfr': float(ordinary.rates[0]),
+        'mle_post_cfr': float(ordinary.rates[1]),
+        'mle_risk_ratio': float(ordinary.rates[1] / ordinary.rates[0]),
     }
+    if not fit.success:
+        result['interval_status'] = 'failed:regularized_fit_nonconvergence'
+        return result
     try:
-        intervals = fixed_tau_wald_intervals(
-            fit, np.zeros(int(active.sum()), dtype=float), design[active]
+        intervals = regularized_parameter_intervals(
+            fit, np.zeros(int(active.sum()), dtype=float), design[active],
+            precision=reporting.precision, confidence=reporting.confidence,
+            covariance=reporting.covariance,
         )
     except (ValueError, np.linalg.LinAlgError) as exc:
         result['interval_status'] = f'failed:{type(exc).__name__}'
@@ -257,7 +278,7 @@ def _two_rate_intervals(
         'post_cfr_upper': float(intervals.cfr_upper[1]),
         'risk_ratio_lower': float(intervals.risk_ratio_lower),
         'risk_ratio_upper': float(intervals.risk_ratio_upper),
-        'interval_status': 'success:fixed_tau_descriptive',
+        'interval_status': 'success:regularized_sandwich_approximate',
     })
     return result
 
@@ -275,7 +296,12 @@ def monitor_series(
     seed: int,
     backend: str = 'c',
     lag_offset: int = 1,
+    boundary_policy: str = GAUSSIAN_SPENDING_POLICY,
 ) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame]:
+    if boundary_policy not in {GAUSSIAN_SPENDING_POLICY, LEGACY_GAUSSIAN_POLICY}:
+        raise ValueError('unknown boundary policy')
+    if frame.empty or first_look < 1 or look_every < 1:
+        raise ValueError('nonempty series and positive look schedule required')
     frame = frame.sort_values('date').reset_index(drop=True)
     cases = frame['cases'].to_numpy(float)
     deaths = frame['deaths'].to_numpy(float)
@@ -283,7 +309,21 @@ def monitor_series(
     looks = list(range(first_look, len(frame) + 1, look_every))
     if not looks or looks[-1] != len(frame):
         looks.append(len(frame))
-    multipliers = make_sampler(seed, backend=backend).standard_normal((n_multiplier, len(frame)))
+    normal_mode = 'pcg32-numpy-box-muller-v1' if boundary_policy == GAUSSIAN_SPENDING_POLICY else 'scalar'
+    multipliers = gaussian_multiplier_bank(make_sampler(seed, backend=backend),
+        (n_multiplier, len(frame)), normal_mode=normal_mode)
+    boundary_state = GaussianSpendingBoundary(n_multiplier, len(looks), REAL_DATA.alpha)
+    input_payload = frame[['date', 'cases', 'deaths']].to_csv(index=False).encode('utf-8')
+    provenance = {
+        'boundary_policy': boundary_policy, 'multiplier_seed': int(seed),
+        'multiplier_paths': int(n_multiplier), 'multiplier_normal_mode': normal_mode,
+        'multiplier_bank_sha256': _sha256(np.ascontiguousarray(multipliers, dtype='<f8').tobytes()),
+        'input_series_sha256': _sha256(input_payload),
+        'delay_sha256': _sha256(np.ascontiguousarray(delay, dtype='<f8').tobytes()),
+        'observation_start': observation_start, 'candidate_start': candidate_start,
+        'lag_offset': lag_offset, 'planned_prefixes': looks, 'backend': backend,
+        'alpha': REAL_DATA.alpha,
+    }
     local_alpha = REAL_DATA.alpha / len(looks)
     trace: list[dict[str, Any]] = []
     alarm = None
@@ -298,12 +338,22 @@ def monitor_series(
         )
         threshold = np.inf
         pvalue = np.nan
-        if scan.candidates.size and np.isfinite(scan.statistic):
+        maxima = None
+        available = bool(scan.candidates.size and np.isfinite(scan.statistic))
+        if available:
             maxima = multiplier_statistics_from_draws(
                 multipliers[:, :prefix], scan.influence, backend=backend
             )
-            threshold = monte_carlo_critical_value(maxima, local_alpha)
+            if boundary_policy == LEGACY_GAUSSIAN_POLICY:
+                threshold = monte_carlo_critical_value(maxima, local_alpha)
             pvalue = (1 + np.count_nonzero(maxima >= scan.statistic)) / (n_multiplier + 1)
+        diagnostics = {}
+        if boundary_policy == GAUSSIAN_SPENDING_POLICY:
+            boundary_look = boundary_state.advance(maxima, available=available)
+            threshold = boundary_look.boundary
+            diagnostics = {name: getattr(boundary_look, name) for name in boundary_look.__dataclass_fields__}
+            diagnostics['numerical_crossing_probability'] = boundary_look.strict_crossed_total / n_multiplier
+            diagnostics['reference_diagnostic_scope'] = 'training Gaussian bank; not observed-data size'
         crossed = bool(np.isfinite(scan.statistic) and scan.statistic > threshold)
         row = {
             'series': series,
@@ -313,7 +363,12 @@ def monitor_series(
             'statistic': scan.statistic,
             'critical_value': threshold,
             'multiplier_pvalue': pvalue,
-            'episode_adjusted_pvalue': min(1.0, len(looks) * pvalue) if np.isfinite(pvalue) else np.nan,
+            **({'episode_adjusted_pvalue': min(1.0, len(looks) * pvalue) if np.isfinite(pvalue) else np.nan}
+               if boundary_policy == LEGACY_GAUSSIAN_POLICY else {}),
+            'boundary_policy': boundary_policy,
+            'evidence_margin': float(scan.statistic - threshold),
+            'multiplier_pvalue_scope': 'marginal fixed-look diagnostic only',
+            **diagnostics,
             'tau_hat': scan.tau_hat,
             'estimated_change_date': (
                 dates.iloc[int(scan.tau_hat)].date().isoformat()
@@ -338,7 +393,15 @@ def monitor_series(
         'alarm': alarm is not None,
         'alarm_date': '' if alarm is None else alarm['look_date'],
         'estimated_change_date': '' if alarm is None else alarm['estimated_change_date'],
-        'episode_adjusted_pvalue': np.nan if alarm is None else alarm['episode_adjusted_pvalue'],
+        **({'episode_adjusted_pvalue': np.nan if alarm is None else alarm['episode_adjusted_pvalue']}
+           if boundary_policy == LEGACY_GAUSSIAN_POLICY else {}),
+        'boundary_policy': boundary_policy,
+        'alarm_prefix': np.nan if alarm is None else alarm['prefix'],
+        'statistic_at_alarm': np.nan if alarm is None else alarm['statistic'],
+        'boundary_at_alarm': np.nan if alarm is None else alarm['critical_value'],
+        'cumulative_alpha_at_alarm': np.nan if alarm is None else REAL_DATA.alpha * alarm['look_number'] / len(looks),
+        'interval_scope': 'unadjusted descriptive at selected change and random first alarm',
+        'provenance': provenance,
     }
     if alarm is not None and alarm_scan is not None:
         summary.update(
@@ -375,7 +438,8 @@ def monitor_series(
     return summary, pd.DataFrame(trace), pd.DataFrame(benchmark_rows)
 
 
-def run_applications(data_dir: Path, output_dir: Path, *, backend: str = 'c') -> pd.DataFrame:
+def run_applications(data_dir: Path, output_dir: Path, *, backend: str = 'c',
+                     boundary_policy: str = GAUSSIAN_SPENDING_POLICY) -> pd.DataFrame:
     covid = pd.read_csv(data_dir / 'processed' / 'who_covid_processed.csv')
     dengue = pd.read_csv(_processed_dengue_path(data_dir))
     covid_delay = gamma_delay_pmf(14.0, shape=4.0, maximum_lag=45)
@@ -403,6 +467,7 @@ def run_applications(data_dir: Path, output_dir: Path, *, backend: str = 'c') ->
             n_multiplier=REAL_DATA.n_multiplier,
             seed=REAL_DATA.master_seed + len(summaries),
             backend=backend,
+            boundary_policy=boundary_policy,
         )
         summaries.append(summary)
         traces.append(trace)
@@ -419,16 +484,31 @@ def run_applications(data_dir: Path, output_dir: Path, *, backend: str = 'c') ->
         n_multiplier=REAL_DATA.n_multiplier,
         seed=REAL_DATA.master_seed + len(summaries),
         backend=backend,
+        boundary_policy=boundary_policy,
         lag_offset=0,
     )
     summaries.append(summary)
     traces.append(trace)
     benchmarks.append(benchmark)
     output_dir.mkdir(parents=True, exist_ok=True)
+    input_paths = [data_dir / 'processed' / 'who_covid_processed.csv', _processed_dengue_path(data_dir)]
+    manifest = {
+        'status': 'complete', 'boundary_policy': boundary_policy, 'backend': backend,
+        'input_files': {path.name: _sha256(path.read_bytes()) for path in input_paths},
+        'source_files': {name: _sha256((Path(__file__).parent / name).read_bytes())
+                         for name in ('config.py', 'methods.py', 'real_data.py')},
+        'series': {row['series']: row.pop('provenance') for row in summaries},
+        'interval_scope': 'unadjusted descriptive; no selection-adjusted coverage claim',
+    }
     summary_frame = pd.DataFrame(summaries)
     summary_frame.to_csv(output_dir / 'application_summary.csv', index=False)
     pd.concat(traces, ignore_index=True).to_csv(output_dir / 'look_trace.csv', index=False)
     pd.concat(benchmarks, ignore_index=True).to_csv(output_dir / 'benchmark_statistics.csv', index=False)
+    manifest['artifacts'] = {name: _sha256((output_dir / name).read_bytes()) for name in
+        ('application_summary.csv', 'look_trace.csv', 'benchmark_statistics.csv')}
+    temporary = output_dir / 'manifest.json.tmp'
+    temporary.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding='utf-8')
+    os.replace(temporary, output_dir / 'manifest.json')
     return summary_frame
 
 
@@ -490,6 +570,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('--output', type=Path, default=base / 'outputs' / 'real_data')
     parser.add_argument('--backend', choices=('c', 'python', 'auto'), default='c',
                         help='strict C backend by default; python/auto are portability options')
+    parser.add_argument('--boundary-policy', choices=(GAUSSIAN_SPENDING_POLICY, LEGACY_GAUSSIAN_POLICY),
+                        default=GAUSSIAN_SPENDING_POLICY)
     parser.add_argument('--refresh', action='store_true')
     args = parser.parse_args(argv)
     data_dir = args.data.resolve()
@@ -498,7 +580,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(prepare_all(data_dir, refresh=args.refresh), indent=2))
     summary_path = output_dir / 'application_summary.csv'
     if args.stage in {'all', 'run'}:
-        summary = run_applications(data_dir, output_dir, backend=args.backend)
+        summary = run_applications(data_dir, output_dir, backend=args.backend, boundary_policy=args.boundary_policy)
     elif summary_path.exists():
         summary = pd.read_csv(summary_path, keep_default_na=False, na_values=[''])
     else:

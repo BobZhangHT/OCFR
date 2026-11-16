@@ -317,21 +317,35 @@ OCFR_API int ocfr_multiplier_maxima(
     if (!multipliers || !influence || !out || n_multiplier <= 0 ||
         n_obs <= 0 || n_candidates <= 0)
         return 1;
-    for (int b = 0; b < n_multiplier; ++b) {
-        double maximum = 0.0;
-        const double *xi = multipliers + (size_t)b * (size_t)n_obs;
-        for (int k = 0; k < n_candidates; ++k) {
-            double process = 0.0;
-            for (int s = 0; s < n_obs; ++s) {
-                process +=
-                    xi[s] * influence[(size_t)s * (size_t)n_candidates +
-                                      (size_t)k];
-            }
-            const double squared = process * process;
-            if (k == 0 || squared > maximum) maximum = squared;
+    /* Check every row-major byte offset before allocating or indexing. */
+    const size_t B = (size_t)n_multiplier;
+    const size_t n = (size_t)n_obs;
+    const size_t K = (size_t)n_candidates;
+    if (n > SIZE_MAX / sizeof(double) / B ||
+        K > SIZE_MAX / sizeof(double) / n)
+        return 1;
+    double *process = (double *)malloc(K * sizeof(double));
+    if (!process) return 2;
+    for (size_t b = 0; b < B; ++b) {
+        const double *xi = multipliers + b * n;
+        for (size_t k = 0; k < K; ++k) process[k] = 0.0;
+        /* Adjacent candidate columns are independent SIMD lanes. Each lane
+         * still accumulates observations in exactly the original s order;
+         * do not replace this with a reassociated reduction or fast-math. */
+        for (size_t s = 0; s < n; ++s) {
+            const double draw = xi[s];
+            const double *row = influence + s * K;
+            for (size_t k = 0; k < K; ++k)
+                process[k] += draw * row[k];
+        }
+        double maximum = process[0] * process[0];
+        for (size_t k = 1; k < K; ++k) {
+            const double squared = process[k] * process[k];
+            if (squared > maximum) maximum = squared;
         }
         out[b] = maximum;
     }
+    free(process);
     return 0;
 }
 
@@ -601,5 +615,179 @@ OCFR_API int ocfr_rng_binomial(
             if (ocfr_uniform_open(&rng) < p) ++successes;
         out[i] = successes;
     }
+    return 0;
+}
+
+
+/* Frozen-nuisance NB-GLR and Page statistics at increasing planned looks.
+ * The nuisance fit, exposure and residual construction stay with the caller.
+ * No statistic reads observations at or after its prefix length. */
+static void ocfr_nb_logscale_score(
+    int start, int end, const double *y, const double *mu, double phi,
+    double eta, double *score, double *hessian
+) {
+    const double gamma = exp(eta);
+    *score = 0.0;
+    *hessian = 0.0;
+    for (int i = start; i < end; ++i) {
+        const double fitted = gamma * mu[i];
+        const double denominator = phi + fitted;
+        *score += phi * (y[i] - fitted) / denominator;
+        *hessian -= (phi / denominator) * (fitted / denominator) * (phi + y[i]);
+    }
+}
+
+static double ocfr_profile_nb_scale(
+    int start, int end, const double *y, const double *mu, double phi,
+    double *scale
+) {
+    double sum_y = 0.0, sum_mu = 0.0;
+    for (int i = start; i < end; ++i) {
+        sum_y += y[i];
+        sum_mu += mu[i];
+    }
+    if (sum_y == 0.0) {
+        double lr_half = sum_mu;
+        if (phi < 1e7) {
+            lr_half = 0.0;
+            for (int i = start; i < end; ++i)
+                lr_half += phi * log1p(mu[i] / phi);
+        }
+        *scale = 0.0;
+        return 2.0 * lr_half;
+    }
+    double eta = log(sum_y) - log(sum_mu);
+    if (phi >= 1e7) {
+        *scale = exp(eta);
+        return fmax(0.0, 2.0 * (sum_y * eta - (*scale - 1.0) * sum_mu));
+    }
+    double score, hessian;
+    double step = 1.0, lower = eta - 1.0, upper = eta + 1.0;
+    ocfr_nb_logscale_score(start, end, y, mu, phi, lower, &score, &hessian);
+    while (score < 0.0) {
+        step *= 2.0;
+        lower = eta - step;
+        ocfr_nb_logscale_score(start, end, y, mu, phi, lower, &score, &hessian);
+    }
+    step = 1.0;
+    ocfr_nb_logscale_score(start, end, y, mu, phi, upper, &score, &hessian);
+    while (score > 0.0) {
+        step *= 2.0;
+        upper = eta + step;
+        ocfr_nb_logscale_score(start, end, y, mu, phi, upper, &score, &hessian);
+    }
+    for (int iteration = 0; iteration < 100; ++iteration) {
+        ocfr_nb_logscale_score(start, end, y, mu, phi, eta, &score, &hessian);
+        if (score == 0.0) break;
+        if (score > 0.0) lower = eta;
+        else upper = eta;
+        double proposal = hessian < 0.0 ? eta - score / hessian : NAN;
+        if (!isfinite(proposal) || proposal <= lower || proposal >= upper)
+            proposal = 0.5 * (lower + upper);
+        if (fabs(proposal - eta) <= 2e-14 * (1.0 + fabs(eta))) {
+            eta = proposal;
+            break;
+        }
+        eta = proposal;
+    }
+    const double gamma = exp(eta);
+    int separate_logs = 0;
+    for (int i = start; i < end; ++i)
+        if ((gamma - 1.0) * mu[i] / (phi + mu[i]) < -0.5)
+            separate_logs = 1;
+    double lr_half = 0.0;
+    for (int i = start; i < end; ++i) {
+        const double log_ratio = separate_logs
+            ? log1p(gamma * mu[i] / phi) - log1p(mu[i] / phi)
+            : log1p((gamma - 1.0) * mu[i] / (phi + mu[i]));
+        lr_half += y[i] * eta - (y[i] + phi) * log_ratio;
+    }
+    *scale = gamma;
+    return fmax(0.0, 2.0 * lr_half);
+}
+
+OCFR_API int ocfr_surveillance_benchmark_traces(
+    int n, int reference_end, int n_looks,
+    const double *deaths, const double *baseline_mean, const double *residuals,
+    double phi, double allowance, const int *looks,
+    double *statistics, int *locations, int *directions
+) {
+    if (!deaths || !baseline_mean || !residuals || !looks || !statistics ||
+        !locations || !directions || n <= 0 || reference_end < 0 ||
+        reference_end >= n || n_looks <= 0 || !(phi > 0.0) ||
+        !isfinite(allowance) || allowance < 0.0 ||
+        (size_t)n > SIZE_MAX / sizeof(double) ||
+        (size_t)n_looks > SIZE_MAX / sizeof(double) / 2)
+        return 1;
+    int previous = reference_end;
+    for (int j = 0; j < n_looks; ++j) {
+        if (looks[j] <= previous || looks[j] > n) return 1;
+        previous = looks[j];
+    }
+    double *storage = (double *)malloc((size_t)n * sizeof(double));
+    if (!storage) return 2;
+    double *mu = storage;
+    for (int i = reference_end; i < n; ++i) {
+        if (!isfinite(deaths[i]) || deaths[i] < 0.0 ||
+            !isfinite(baseline_mean[i]) || !isfinite(residuals[i])) {
+            free(storage);
+            return 1;
+        }
+        mu[i] = fmax(baseline_mean[i], 1e-12);
+
+    }
+    double positive = 0.0, negative = 0.0;
+    int positive_start = reference_end, negative_start = reference_end;
+    previous = reference_end;
+    for (int j = 0; j < n_looks; ++j) {
+        const int prefix = looks[j];
+        double best = -INFINITY, best_scale = 1.0;
+        int best_calendar = reference_end;
+        for (int change = reference_end; change < prefix; ++change) {
+            double scale;
+            const double statistic = ocfr_profile_nb_scale(
+                change, prefix, deaths, mu, phi, &scale);
+            /* Strict comparison preserves the first candidate on a tie. */
+            if (statistic > best) {
+                best = statistic;
+                best_calendar = change;
+                best_scale = scale;
+            }
+        }
+        statistics[(size_t)j * 2] = best;
+        locations[(size_t)j * 2] = best_calendar;
+        directions[(size_t)j * 2] = (best_scale > 1.0) - (best_scale < 1.0);
+        for (int day = previous; day < prefix; ++day) {
+            const double value = residuals[day];
+            if (positive + value - allowance <= 0.0) {
+                positive = 0.0;
+                positive_start = day + 1;
+            } else {
+                positive += value - allowance;
+            }
+            if (negative - value - allowance <= 0.0) {
+                negative = 0.0;
+                negative_start = day + 1;
+            } else {
+                negative += -value - allowance;
+            }
+        }
+        const size_t index = (size_t)j * 2 + 1;
+        if (positive <= 0.0 && negative <= 0.0) {
+            statistics[index] = 0.0;
+            locations[index] = prefix - 1;
+            directions[index] = 0;
+        } else if (positive >= negative) {
+            statistics[index] = positive;
+            locations[index] = positive_start;
+            directions[index] = 1;
+        } else {
+            statistics[index] = negative;
+            locations[index] = negative_start;
+            directions[index] = -1;
+        }
+        previous = prefix;
+    }
+    free(storage);
     return 0;
 }

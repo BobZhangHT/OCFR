@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Literal
 
 Mode = Literal["demo", "full"]
-Split = Literal["calibration", "holdout", "alternative"]
+Split = Literal["calibration", "holdout", "alternative", "size_audit"]
 ReplicationPlan = tuple[tuple[Split, int], ...]
 
 # This named plan is deliberately separate from ``full``.  The public
@@ -32,6 +32,67 @@ class MethodConfig:
     cusum_allowance: float = 0.5
     use_lindeberg_gate: bool = True
     backend: str = "c"  # strict release default
+
+@dataclass(frozen=True)
+class EstimationConfig:
+    """Descriptive plug-in Wald assessment at the first Gaussian alarm."""
+    confidence: float = 0.95
+    method: str = "OCFR Gaussian"
+    scope: str = "on_model_alternatives_first_alarm"
+
+    def __post_init__(self):
+        if self.confidence != 0.95 or self.method not in {"OCFR Gaussian", "OCFR"} or self.scope != "on_model_alternatives_first_alarm":
+            raise ValueError("the frozen estimation assessment uses 95% first-Gaussian-alarm Wald intervals")
+
+@dataclass(frozen=True)
+class PostAlarmEstimationConfig:
+    """Reporting settings, separate from the frozen detection/DGP payload."""
+    precision: float = 1.0
+    covariance: str = 'sandwich'
+    confidence: float = 0.95
+    estimator: str = 'regularized_log_rr'
+    diagnostic_covariance: str = 'unpenalized'
+
+    def __post_init__(self):
+        if (self.precision != 1.0 or self.covariance != 'sandwich' or
+                self.confidence != 0.95 or self.estimator != 'regularized_log_rr' or
+                self.diagnostic_covariance != 'unpenalized'):
+            raise ValueError('post-alarm reporting uses fixed precision 1 and approximate sandwich intervals')
+
+
+@dataclass(frozen=True)
+class PostAlarmValidationConfig:
+    """Independent validation seed; detector settings come from the frozen study."""
+    validation_master_seed: int = 2026110702
+    policy: str = 'first Gaussian crossing with fixed full-episode multiplier bank'
+
+
+@dataclass(frozen=True)
+class PostAlarmPoissonConfig:
+    """Point comparison settings, outside the immutable scientific payload."""
+    primary_precision: float = 1.0
+    control_precision: float = 0.0
+    likelihood: str = 'exact_poisson'
+    interval_scope: str = 'point_only'
+
+    def __post_init__(self):
+        if (self.primary_precision != 1.0 or self.control_precision != 0.0 or
+                self.likelihood != 'exact_poisson' or self.interval_scope != 'point_only'):
+            raise ValueError('Poisson comparison fixes precisions 1 and 0 and reports points only')
+
+
+@dataclass(frozen=True)
+class PostAlarmLSConfig:
+    """Point comparison settings outside the frozen DGP/detection payload."""
+    loss: str = 'daily_squared_error'
+    penalty: float = 0.0
+    interval_scope: str = 'point_only'
+
+    def __post_init__(self):
+        if (self.loss != 'daily_squared_error' or self.penalty != 0.0 or
+                self.interval_scope != 'point_only'):
+            raise ValueError('LS comparison uses unpenalized daily squared error and points only')
+
 
 @dataclass(frozen=True)
 class DGPConfig:
@@ -92,8 +153,17 @@ class ExperimentConfig:
     protocol: str = "standard"
     split_replications: ReplicationPlan | None = None
 
+    @property
+    def boundary_policy(self) -> str:
+        return GAUSSIAN_SPENDING_POLICY if self.protocol == "compact-v2" else LEGACY_GAUSSIAN_POLICY
+
+    def stage_methods(self, stage: str) -> tuple[str, ...]:
+        return compact_stage_methods(self.protocol, stage)
+
     def replications_for(self, split: Split) -> int:
         """Number of replicate tasks for a cell in ``split``."""
+        if self.protocol == "compact-v1" and split in {"calibration", "size_audit"}:
+            return 10_000 if split == "calibration" else 5_000
         if self.split_replications is None:
             return self.replications
         planned = dict(self.split_replications)
@@ -106,13 +176,41 @@ class ExperimentConfig:
         return value
 
     def scientific_payload(self) -> dict[str, object]:
-        return {"master_seed": self.master_seed,
+        payload = {"master_seed": self.master_seed,
                 "rng_contract_version": self.rng_contract_version,
                 "dgp": asdict(self.dgp), "methods": asdict(self.methods),
                 "protocol": self.protocol,
                 "split_replications": (dict(self.split_replications)
                                        if self.split_replications is not None else None),
                 "scenarios": [asdict(x) for x in self.scenarios]}
+        if self.protocol == "compact-v1":
+            payload["compact_contract"] = {
+                "calibration_episodes_per_family": 10_000,
+                "audit_episodes_per_family": 5_000,
+                "empirical_statistic": "maximum raw planned-look statistic",
+                "calibration_rank": "ceil((B+1)*(1-alpha)); strict crossing",
+                "stage_methods": {"calibration": list(COMPACT_EMPIRICAL_METHODS),
+                                  "audit": list(COMPACT_EMPIRICAL_METHODS),
+                                  "evaluation": list(COMPACT_METHODS)},
+                "outcome_model": "NB except explicitly named cohort_binomial",
+                "wave_mean": "1000*q/mean(q)",
+            }
+        if self.protocol == "compact-v2":
+            payload["compact_contract"] = {
+                "boundary_policy": self.boundary_policy,
+                "cumulative_budget": "alpha*j/J; planned look index",
+                "rank": "ceil((1-alpha*j/J)*(B+1)); original B",
+                "calibration_removal": "eligible maxima >= boundary; all tied supports removed",
+                "alarm_rule": "observed raw score > boundary",
+                "reference_diagnostics": "strict crossing mask separate from eligibility/support masks",
+                "multiplier_bank": "fixed full B by horizon; persistent row identity; prefix columns only",
+                "normal_generation": "pcg32-numpy-box-muller-v1 for Python multiplier banks; scalar count streams unchanged",
+                "unavailable_or_unresolved": "infinite boundary; advance planned index; masks unchanged",
+                "stage_methods": {stage: list(self.stage_methods(stage)) for stage in ("calibration", "audit", "evaluation")},
+                "outcome_model": "NB except explicitly named cohort_binomial",
+                "wave_mean": "1000*q/mean(q)",
+            }
+        return payload
 
 @dataclass(frozen=True)
 class RealDataConfig:
@@ -125,6 +223,7 @@ class RealDataConfig:
     alpha: float = 0.05
     n_multiplier: int = 10_000
     master_seed: int = 2026072602
+
 
 METHODS = MethodConfig()
 DGP = DGPConfig()
@@ -197,6 +296,69 @@ def get_size_control_experiment_config(*, backend: str | None = None) -> Experim
     return replace(full, protocol="size-control-v1",
                    split_replications=SIZE_CONTROL_REPLICATION_PLAN)
 
+
+COMPACT_METHODS = ("OCFR Gaussian", "OCFR empirical", "NB-GLR", "Page-CUSUM",
+                   "Report-day score")
+COMPACT_EMPIRICAL_METHODS = COMPACT_METHODS[1:]
+
+
+def _compact_scenarios() -> tuple[SimulationScenario, ...]:
+    """Frozen 27-cell evaluation bank plus explicit auxiliary stages."""
+    cells = []
+    for family, profile, level in (("steady", "constant", 1000.),
+                                    ("sparse", "constant", 250.),
+                                    ("wave", "compact_wave", 1000.)):
+        def add(suffix, split, rr=1., day=92, intervention="on_model", delay=14.,
+                outcome_group=None):
+            cells.append(_cell(
+                f"{family}_{suffix}", family, split, profile, level,
+                .02, .02 * rr, 10., change_fraction=(day - 1) / 182,
+                true_delay=delay, case_group=family,
+                outcome_group=outcome_group or f"{family}_{suffix}",
+                misspecification=intervention, motivation=suffix))
+        add("calibration", "calibration")
+        add("audit", "size_audit")
+        add("null", "holdout")
+        for label, rr in (("rr067", 2 / 3), ("rr125", 1.25),
+                          ("rr150", 1.5), ("rr200", 2.)):
+            add(label, "alternative", rr)
+        if family in {"steady", "wave"}:
+            for day in (47, 137):
+                add(f"rr150_day{day}", "alternative", 1.5, day)
+        if family == "wave":
+            for delay in (11., 17.):
+                for suffix, split, rr in (("null", "holdout", 1.),
+                                           ("rr150", "alternative", 1.5)):
+                    add(f"delay{int(delay)}_{suffix}", split, rr,
+                        intervention="delay_error", delay=delay)
+            for suffix, split, rr in (("null", "holdout", 1.),
+                                       ("rr150", "alternative", 1.5)):
+                add(f"binomial_{suffix}", split, rr,
+                    intervention="cohort_binomial")
+            for scale in (.75, 1.25):
+                add(f"ascertainment{int(scale * 100)}", "holdout",
+                    intervention=f"exposure_scale_{scale}",
+                    outcome_group="wave_null")
+    return tuple(cells)
+
+
+COMPACT_SCENARIOS = _compact_scenarios()
+
+
+def get_compact_experiment_config(mode: Mode, *, backend: str | None = None, protocol: str = "compact-v2") -> ExperimentConfig:
+    """V2 demo/full vary all allocated stage counts, with fixed numerical settings.
+
+    Explicit v1 reproduction retains its frozen auxiliary allocations.
+    """
+    if protocol not in {"compact-v1", "compact-v2"}:
+        raise ValueError("unknown compact protocol")
+    base = get_experiment_config(mode, backend=backend)
+    if protocol == "compact-v2":
+        base = replace(base, methods=replace(base.methods, n_multiplier=1_999))
+    return replace(base, protocol=protocol, master_seed=2026110501 if protocol == "compact-v1" else 2026111404,
+                   rng_contract_version="ocfr-compact-pcg32-v1",
+                   scenarios=COMPACT_SCENARIOS, split_replications=None)
+
 def validate_mode_contract() -> None:
     demo, full = get_experiment_config("demo"), get_experiment_config("full")
     if (demo.replications, full.replications) != (10, 1000):
@@ -205,3 +367,80 @@ def validate_mode_contract() -> None:
         raise AssertionError("demo and full may differ only in replications")
 
 validate_mode_contract()
+
+
+GAUSSIAN_SPENDING_POLICY = "gaussian-first-crossing-linear-support-discard-v1"
+LEGACY_GAUSSIAN_POLICY = "online_gaussian_process_bonferroni_looks"
+COMPACT_V2_METHODS = ("OCFR", "NB-GLR", "Page-CUSUM")
+COMPACT_V2_CALIBRATION_METHODS = ("NB-GLR", "Page-CUSUM")
+COMPACT_RELEASE_REPLICATION_PLAN: ReplicationPlan = (
+    ("calibration", 10_000), ("size_audit", 5_000),
+    ("holdout", 1_000), ("alternative", 1_000))
+
+
+def compact_stage_methods(protocol: str, stage: str) -> tuple[str, ...]:
+    if stage not in {"calibration", "audit", "evaluation"}:
+        raise ValueError("unknown compact stage")
+    if protocol == "compact-v2":
+        return COMPACT_V2_CALIBRATION_METHODS if stage == "calibration" else COMPACT_V2_METHODS
+    if protocol == "compact-v1":
+        return COMPACT_EMPIRICAL_METHODS if stage in {"calibration", "audit"} else COMPACT_METHODS
+    raise ValueError("unknown compact protocol")
+
+
+def get_compact_release_study_config(*, backend: str | None = None) -> ExperimentConfig:
+    return replace(get_compact_experiment_config("full", backend=backend),
+                   split_replications=COMPACT_RELEASE_REPLICATION_PLAN)
+
+
+def get_post_alarm_validation_config(protocol: str) -> PostAlarmValidationConfig:
+    if protocol == "compact-v2":
+        return PostAlarmValidationConfig(2026111405, GAUSSIAN_SPENDING_POLICY)
+    if protocol == "compact-v1":
+        return PostAlarmValidationConfig()
+    raise ValueError("unknown compact protocol")
+
+
+SENSITIVITY_EXTENSION_VERSION = "figure6-ten-cell-v1"
+
+
+def get_sensitivity_extension_config(base: ExperimentConfig) -> ExperimentConfig:
+    """Ten additional cells only; retain the parent's numerical/RNG settings."""
+    if base.protocol != "compact-v2" or base.mode not in {"demo", "full"}:
+        raise ValueError("sensitivity extension requires a compact-v2 demo/full parent")
+    cells = []
+    for delay in (12., 13., 15., 16.):
+        for suffix, split, rr in (("null", "holdout", 1.),
+                                  ("rr150", "alternative", 1.5)):
+            name = f"wave_delay{int(delay)}_{suffix}"
+            cells.append(_cell(name, "wave", split, "compact_wave", 1000.,
+                .02, .02 * rr, 10., true_delay=delay, case_group="wave",
+                outcome_group=name, misspecification="delay_error",
+                motivation=f"delay{int(delay)}_{suffix}"))
+    for scale in (.9, 1.1):
+        name = f"wave_ascertainment{int(scale * 100)}"
+        cells.append(_cell(name, "wave", "holdout", "compact_wave", 1000.,
+            .02, .02, 10., case_group="wave", outcome_group="wave_null",
+            misspecification=f"exposure_scale_{scale}",
+            motivation=f"ascertainment{int(scale * 100)}"))
+    return replace(base, scenarios=tuple(cells), split_replications=None)
+
+
+DISPERSION_SENSITIVITY_VERSION = "figure6-dispersion-v1"
+
+
+def get_dispersion_sensitivity_config(base: ExperimentConfig) -> ExperimentConfig:
+    """Frozen eight-cell grid; RR=1 uses the alternative split for case pairing.
+
+    Statistical null/alternative labels are determined from RR when reporting.
+    The split is an RNG allocation, not a scientific null declaration here.
+    """
+    if base.protocol != "compact-v2" or base.mode not in {"demo", "full"}:
+        raise ValueError("dispersion sensitivity requires a compact-v2 demo/full parent")
+    template = next(s for s in base.scenarios if s.name == "wave_rr150")
+    cells = tuple(replace(template, name=f"d_phi{phi}_rr{rr:g}", phi=float(phi),
+        pi_right=.02 * rr, case_stream_group="dispersion_shared",
+        outcome_stream_group="dispersion_shared", misspecification="dispersion_sensitivity",
+        motivation="prespecified dispersion sensitivity under correct mean")
+        for phi in (5, 10, 20, 40) for rr in (1., 1.5))
+    return replace(base, master_seed=2026111604, scenarios=cells, split_replications=None)

@@ -57,6 +57,11 @@ class FastKernels:
         self.lib.ocfr_gp_score_fields.restype = ctypes.c_int
         self.lib.ocfr_multiplier_maxima.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, _DOUBLE_PTR, _DOUBLE_PTR, _DOUBLE_PTR]
         self.lib.ocfr_multiplier_maxima.restype = ctypes.c_int
+        self.lib.ocfr_surveillance_benchmark_traces.argtypes = [
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, _DOUBLE_PTR, _DOUBLE_PTR,
+            _DOUBLE_PTR, ctypes.c_double, ctypes.c_double, ctypes.POINTER(ctypes.c_int),
+            _DOUBLE_PTR, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
+        self.lib.ocfr_surveillance_benchmark_traces.restype = ctypes.c_int
         self.lib.ocfr_rng_uniform.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int, _DOUBLE_PTR]
         self.lib.ocfr_rng_uniform.restype = ctypes.c_int
         self.lib.ocfr_rng_normal.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int, _DOUBLE_PTR]
@@ -193,6 +198,8 @@ class FastKernels:
             raise ValueError('influence must contain at least one candidate')
         if influence.shape[0] != multipliers.shape[1]:
             raise ValueError('multipliers and influence have incompatible observation dimensions')
+        if max(*multipliers.shape, influence.shape[1]) > np.iinfo(np.int32).max:
+            raise ValueError('multiplier dimensions exceed the C int ABI limit')
         if not np.all(np.isfinite(multipliers)):
             raise ValueError('multipliers must contain only finite values')
         if not np.all(np.isfinite(influence)):
@@ -204,6 +211,43 @@ class FastKernels:
         if code != 0:
             raise RuntimeError(f'ocfr_multiplier_maxima failed with code {code}')
         return out
+
+    def surveillance_benchmark_traces(self, deaths, mean, residuals, phi,
+                                      reference_end, looks, allowance):
+        """Compute both count-chart traces from one frozen Python nuisance fit."""
+        arrays = [np.ascontiguousarray(x, dtype=np.float64)
+                  for x in (deaths, mean, residuals)]
+        if any(x.ndim != 1 for x in arrays) or any(x.shape != arrays[0].shape for x in arrays):
+            raise ValueError('surveillance inputs must be equal-length vectors')
+        prefixes = np.asarray(looks)
+        if (prefixes.ndim != 1 or prefixes.size == 0 or
+                not np.all(np.isfinite(prefixes)) or
+                np.any(prefixes != np.floor(prefixes))):
+            raise ValueError('looks must be integer prefix lengths')
+        int_max = np.iinfo(np.int32).max
+        if max(arrays[0].size, prefixes.size, int(np.max(prefixes))) > int_max:
+            raise ValueError('surveillance dimensions exceed the C int ABI limit')
+        prefixes = np.ascontiguousarray(prefixes, dtype=np.int32)
+        if (not isinstance(reference_end, (int, np.integer)) or reference_end < 0 or
+                reference_end >= arrays[0].size or prefixes[0] <= reference_end or
+                np.any(np.diff(prefixes) <= 0) or prefixes[-1] > arrays[0].size):
+            raise ValueError('looks must increase after the reference segment')
+        if (not (phi > 0.0) or not np.isfinite(allowance) or allowance < 0.0 or
+                any(not np.all(np.isfinite(x)) for x in arrays) or
+                np.any(arrays[0] < 0.0)):
+            raise ValueError('invalid frozen surveillance inputs')
+        statistics = np.empty((prefixes.size, 2), dtype=np.float64)
+        locations = np.empty((prefixes.size, 2), dtype=np.int32)
+        directions = np.empty((prefixes.size, 2), dtype=np.int32)
+        int_ptr = ctypes.POINTER(ctypes.c_int)
+        code = self.lib.ocfr_surveillance_benchmark_traces(
+            arrays[0].size, reference_end, prefixes.size,
+            *(x.ctypes.data_as(_DOUBLE_PTR) for x in arrays), float(phi), float(allowance),
+            prefixes.ctypes.data_as(int_ptr), statistics.ctypes.data_as(_DOUBLE_PTR),
+            locations.ctypes.data_as(int_ptr), directions.ctypes.data_as(int_ptr))
+        if code:
+            raise RuntimeError(f'ocfr_surveillance_benchmark_traces failed with code {code}')
+        return statistics, locations, directions
 
     @staticmethod
     def _as_int64(x: np.ndarray) -> np.ndarray:
@@ -304,6 +348,14 @@ import math
 from typing import Any
 import numpy as np
 _NATIVE_KERNELS: Any | None = None
+
+
+def _get_native_kernels() -> FastKernels:
+    """Reuse this process's immutable library binding across analyses."""
+    global _NATIVE_KERNELS
+    if _NATIVE_KERNELS is None:
+        _NATIVE_KERNELS = FastKernels()
+    return _NATIVE_KERNELS
 _MASK64 = (1 << 64) - 1
 _MASK32 = (1 << 32) - 1
 _PCG_MULT = 6364136223846793005
@@ -623,10 +675,7 @@ class CSampler(_SamplerBase):
 
     def __init__(self, seed: int, stream: int=0) -> None:
         super().__init__(seed, stream)
-        global _NATIVE_KERNELS
-        if _NATIVE_KERNELS is None:
-            _NATIVE_KERNELS = FastKernels()
-        self._kernels = _NATIVE_KERNELS
+        self._kernels = _get_native_kernels()
 
     def _call_stream(self) -> int:
         return self._next_stream()
@@ -759,6 +808,225 @@ class NBFit:
     success: bool
     status: str
     nit: int
+
+@dataclass(frozen=True)
+class PoissonFit:
+    """Point-only exact Poisson fit; no NB dispersion or interval semantics."""
+    rates: np.ndarray
+    loglik: float
+    success: bool
+    status: str
+    nit: int
+
+
+@dataclass(frozen=True)
+class LSFit:
+    """Bounded daily least-squares points, with no likelihood or intervals."""
+    rates: np.ndarray
+    rss: float
+    success: bool
+    status: str
+    active_set: str
+    kkt_residual: float
+    kkt_tolerance: float
+
+
+def _ls_candidate_check(rates, y, offset, design):
+    """Independently check box KKT signs in risk coordinates.
+
+    The gradient is divided by a common data scale so the acceptance tolerance
+    is invariant to multiplying all observations and exposures by one constant.
+    Only exactly active bounds may remove an outward gradient component.
+    """
+    rates = np.asarray(rates, dtype=float)
+    if (rates.shape != (2,) or not np.all(np.isfinite(rates)) or
+            np.any(rates < P_BOUNDS[0]) or np.any(rates > P_BOUNDS[1])):
+        return float('inf'), 1e-10, False
+    residual = offset + design @ rates - y
+    gradient = 2. * (design.T @ residual)
+    scale = max(np.finfo(float).tiny,
+                2. * float(np.linalg.norm(design, 2)) *
+                max(float(np.linalg.norm(y-offset)),
+                    float(np.linalg.norm(design, 2))*float(np.linalg.norm(rates))))
+    projected = gradient / scale
+    projected[(rates == P_BOUNDS[0]) & (gradient >= 0.)] = 0.
+    projected[(rates == P_BOUNDS[1]) & (gradient <= 0.)] = 0.
+    error = float(np.max(np.abs(projected)))
+    tolerance = 1e-10
+    return error, tolerance, bool(np.isfinite(error) and error <= tolerance)
+
+
+def fit_ls_identity(y, offset, design) -> LSFit:
+    """Exactly minimize daily RSS over the same two-risk box as the NB fit.
+
+    Enumerate the unconstrained solution and each bounded one-dimensional
+    edge optimum (including corners). No penalty, cumulative transformation,
+    dispersion estimate or Gaussian profile-log objective is applied.
+    """
+    y, offset, design = (np.asarray(a, dtype=np.float64) for a in (y, offset, design))
+    if (y.ndim != 1 or not y.size or offset.shape != y.shape or
+            design.shape != (y.size, 2)):
+        raise ValueError('LS fit requires y, offset and a two-column design')
+    if (not all(np.all(np.isfinite(a)) for a in (y, offset, design)) or
+            any(np.any(a < 0.) for a in (y, offset, design))):
+        raise ValueError('LS inputs must be finite and nonnegative')
+    if np.linalg.matrix_rank(design) != 2:
+        return LSFit(np.full(2, np.nan), float('nan'), False,
+                     'unidentifiable:rank_deficient_design', 'unidentified',
+                     float('inf'), 1e-10)
+    target = y-offset
+    candidates = []
+    unconstrained = np.linalg.lstsq(design, target, rcond=None)[0]
+    if np.all(unconstrained >= P_BOUNDS[0]) and np.all(unconstrained <= P_BOUNDS[1]):
+        candidates.append(unconstrained)
+    for fixed in (0, 1):
+        free = 1-fixed
+        column = design[:, free]
+        for bound in P_BOUNDS:
+            point = np.empty(2)
+            point[fixed] = bound
+            point[free] = np.clip(column @ (target-design[:, fixed]*bound) /
+                                  (column @ column), *P_BOUNDS)
+            candidates.append(point)
+    rates = min(candidates, key=lambda p: float(np.sum((target-design@p)**2))).copy()
+    rss = float(np.sum((target-design@rates)**2))
+    error, tolerance, stationary = _ls_candidate_check(rates, y, offset, design)
+    active = ','.join('lower' if p == P_BOUNDS[0] else
+                      'upper' if p == P_BOUNDS[1] else 'free' for p in rates)
+    success = bool(np.isfinite(rss) and stationary)
+    return LSFit(rates, rss, success,
+                 'success:active_set' if success else 'nonconvergence:box_kkt',
+                 active, error, tolerance)
+
+
+def _poisson_lograte_nll_and_grad(theta, y, offset, design, precision):
+    """Exact Poisson negative log likelihood plus a fixed log-RR penalty."""
+    rates = np.exp(theta)
+    raw_mu = offset + design @ rates
+    # Structural zero rows with y=0 contribute exactly zero. Positive counts
+    # with a structurally zero mean are rejected by the public input checks.
+    mu = np.where(raw_mu > 0., raw_mu, 1.)
+    ll = float(np.sum(y * np.log(mu) - raw_mu - gammaln(y + 1.)))
+    score = np.where(raw_mu > 0., 1. - y / mu, 0.)
+    gradient = rates * (design.T @ score)
+    delta = theta[1] - theta[0]
+    gradient += precision * delta * np.array([-1., 1.])
+    return -ll + .5 * precision * delta**2, gradient
+
+
+def _poisson_candidate_check(theta, y, offset, design, precision):
+    """Recheck an optimizer candidate at the actual bounded returned risks.
+
+    The log-risk projected score must be at most ``1e-6 + 1e-8 * scale``,
+    where scale is the larger of one, total observed deaths and total fitted
+    deaths. Interior scores must vanish; outward scores are allowed only at
+    the corresponding bound. The 1e-10 bound tolerance is on log risks.
+    """
+    theta = np.asarray(theta, dtype=float)
+    if theta.shape != (2,) or not np.all(np.isfinite(theta)):
+        return float('inf'), np.full(2, np.nan), float('inf'), 0., False
+    lower, upper = np.log(P_BOUNDS)
+    feasible = bool(np.all(theta >= lower-1e-10) and np.all(theta <= upper+1e-10))
+    if not feasible:
+        return float('inf'), np.full(2, np.nan), float('inf'), 0., False
+    bounded_theta = np.log(np.clip(np.exp(theta), *P_BOUNDS))
+    value, gradient = _poisson_lograte_nll_and_grad(bounded_theta, y, offset, design, precision)
+    projected = gradient.copy()
+    projected[(bounded_theta <= lower+1e-10) & (gradient >= 0.)] = 0.
+    projected[(bounded_theta >= upper-1e-10) & (gradient <= 0.)] = 0.
+    residual = float(np.max(np.abs(projected)))
+    scale = max(1., float(y.sum()), float(np.sum(offset+design@np.exp(bounded_theta))))
+    tolerance = 1e-6 + 1e-8*scale
+    stationary = bool(feasible and np.isfinite(value) and np.all(np.isfinite(gradient))
+                       and residual <= tolerance)
+    return value, gradient, residual, tolerance, stationary
+
+
+def fit_poisson_identity(y, offset, design, *, precision=0.0,
+                         initial_rates=None, maxiter=250) -> PoissonFit:
+    """Fit two bounded risks to ``offset + design @ rates`` using exact Poisson ML.
+
+    ``precision`` is the fixed coefficient of ``log(p_right/p_left)**2 / 2``.
+    The returned log likelihood excludes that penalty. Deterministic multiple
+    starts and an explicitly labelled optimizer retry reduce low-count failures;
+    every accepted candidate independently passes bound-constrained score
+    checks. An unsuccessful fit must not be used as a point.
+    This API provides no confidence intervals or selection adjustment.
+    """
+    y, offset, design = (np.asarray(a, dtype=np.float64) for a in (y, offset, design))
+    if (y.ndim != 1 or not y.size or offset.shape != y.shape or
+            design.shape != (y.size, 2)):
+        raise ValueError('Poisson fit requires y, offset and a two-column design')
+    if (not all(np.all(np.isfinite(a)) for a in (y, offset, design)) or
+            any(np.any(a < 0.) for a in (y, offset, design))):
+        raise ValueError('Poisson inputs must be finite and nonnegative')
+    if not np.isfinite(precision) or precision < 0. or maxiter < 0:
+        raise ValueError('invalid Poisson precision or iteration limit')
+    if np.any((offset == 0.) & (design.sum(axis=1) == 0.) & (y > 0.)):
+        raise ValueError('positive Poisson count has a structurally zero mean')
+    if np.linalg.matrix_rank(design) != 2:
+        return PoissonFit(np.full(2, np.nan), float('nan'), False,
+                          'unidentifiable:rank_deficient_design', 0)
+    common = np.clip(np.maximum(y-offset, 0.).sum() / max(design.sum(), MU_FLOOR), *P_BOUNDS)
+    least_squares = np.linalg.lstsq(design, y-offset, rcond=None)[0]
+    starts = [np.full(2, common), np.clip(least_squares, *P_BOUNDS),
+              np.clip(common*np.array([.5, 2.]), *P_BOUNDS),
+              np.clip(common*np.array([2., .5]), *P_BOUNDS)]
+    if initial_rates is not None:
+        initial_rates = np.asarray(initial_rates, dtype=float)
+        if initial_rates.shape != (2,) or not np.all(np.isfinite(initial_rates)):
+            raise ValueError('initial_rates must contain two finite rates')
+        starts.insert(0, np.clip(initial_rates, *P_BOUNDS))
+    bounds = [tuple(np.log(P_BOUNDS))]*2
+    args = (y, offset, design, float(precision))
+    null_objective = _poisson_lograte_nll_and_grad(np.log(np.full(2, common)), *args)[0]
+    results = []
+    total_iterations = 0
+    for index, start in enumerate(starts):
+        if any(np.array_equal(start, previous) for previous in starts[:index]):
+            continue
+        result = minimize(_poisson_lograte_nll_and_grad, np.log(start), args=args,
+            jac=True, method='L-BFGS-B', bounds=bounds,
+            options={'maxiter': maxiter, 'ftol': 1e-13, 'gtol': 1e-8, 'maxls': 60})
+        total_iterations += int(result.nit)
+        objective, gradient, _, _, stationary = _poisson_candidate_check(result.x, *args)
+        result.fun = objective
+        result.poisson_stationary = stationary
+        if np.isfinite(objective) and np.all(np.isfinite(gradient)) and np.all(np.isfinite(result.x)):
+            results.append((result, 'multistart'))
+    if not results:
+        return PoissonFit(np.full(2, np.nan), float('nan'), False,
+                          'nonconvergence:no_finite_candidate', total_iterations)
+    best, label = min(results, key=lambda item: item[0].fun)
+    successful = [item for item in results if item[0].success and item[0].poisson_stationary
+                  and item[0].fun <= best.fun+1e-9]
+    if successful:
+        best, label = min(successful, key=lambda item: item[0].fun)
+    elif maxiter > 0:
+        retry = minimize(lambda theta: _poisson_lograte_nll_and_grad(theta, *args)[0],
+            best.x, method='Powell', bounds=bounds,
+            options={'maxiter': maxiter, 'xtol': 1e-10, 'ftol': 1e-12})
+        total_iterations += int(retry.nit)
+        retry.fun, retry_gradient, _, _, retry.poisson_stationary = _poisson_candidate_check(retry.x, *args)
+        if (retry.success and retry.poisson_stationary and np.isfinite(retry.fun)
+                and np.all(np.isfinite(retry_gradient))
+                and retry.fun <= best.fun+1e-9):
+            best, label = retry, 'powell_retry'
+    rates = np.clip(np.exp(best.x), *P_BOUNDS)
+    raw_mu = offset + design @ rates
+    mu = np.where(raw_mu > 0., raw_mu, 1.)
+    loglik = float(np.sum(y*np.log(mu)-raw_mu-gammaln(y+1.)))
+    finite_and_improved = (np.isfinite(loglik) and np.all(np.isfinite(rates)) and
+        best.fun <= null_objective+1e-9*max(1., abs(null_objective)))
+    _, _, _, _, stationary = _poisson_candidate_check(np.log(rates), *args)
+    success = bool(best.success and best.poisson_stationary and finite_and_improved and stationary)
+    if not finite_and_improved:
+        status = 'nonconvergence:nonfinite_or_worse_than_common_rate'
+    elif not stationary:
+        status = 'nonconvergence:projected_gradient'
+    else:
+        status = 'success:'+label if success else 'nonconvergence:'+str(best.message)
+    return PoissonFit(rates, loglik, success, status, total_iterations)
 
 @dataclass(frozen=True)
 class FixedTauWaldIntervals:
@@ -1055,6 +1323,152 @@ def fixed_tau_wald_intervals(fit: NBFit, offset: np.ndarray, design: np.ndarray,
     return FixedTauWaldIntervals(rates=rates.copy(), cfr_logit=np.asarray(cfr_logit, dtype=np.float64), cfr_logit_lower=np.asarray(cfr_logit_lower, dtype=np.float64), cfr_logit_upper=np.asarray(cfr_logit_upper, dtype=np.float64), cfr_lower=np.asarray(cfr_lower, dtype=np.float64), cfr_upper=np.asarray(cfr_upper, dtype=np.float64), risk_ratio=risk_ratio, log_risk_ratio=log_risk_ratio, log_risk_ratio_lower=log_risk_ratio_lower, log_risk_ratio_upper=log_risk_ratio_upper, risk_ratio_lower=risk_ratio_lower, risk_ratio_upper=risk_ratio_upper, information=information, covariance=covariance, cfr_logit_standard_errors=np.asarray(cfr_logit_standard_errors, dtype=np.float64), log_risk_ratio_standard_error=log_risk_ratio_standard_error)
 fixed_tau_parameter_intervals = fixed_tau_wald_intervals
 
+
+def _regularized_nll_and_grad(theta, y, offset, design, precision):
+    """NB2 negative log likelihood plus a penalty on log(post/pre)."""
+    rates = np.exp(theta[:2])
+    value, gradient = _nll_and_grad(np.r_[rates, theta[2]], y, offset, design)
+    delta = theta[1] - theta[0]
+    gradient = np.r_[gradient[:2] * rates, gradient[2]]
+    gradient[:2] += precision * delta * np.array([-1.0, 1.0])
+    return value + 0.5 * precision * delta**2, gradient
+
+
+def fit_nb_regularized_identity(y, offset, design, *, precision=1.0,
+                                initial_fit=None, maxiter=300) -> NBFit:
+    """Experimental two-rate NB2 fit penalizing ``log(post/pre)**2 / 2``.
+
+    ``precision`` is a fixed nonnegative penalty multiplier, not selected from
+    the observed scenario. Two L-BFGS-B starts use the ordinary fit and a common
+    risk. ``loglik`` always contains the unpenalized likelihood.
+    If both starts fail, bounded Powell minimization retries the same objective.
+    Failed optimization returns baseline parameters with ``success=False``; it never
+    silently reports an ordinary fit as a converged regularized minimum.
+    The existing detector and ordinary estimator do not call this function.
+    """
+    y = np.asarray(y, dtype=np.float64)
+    offset = np.asarray(offset, dtype=np.float64)
+    design = np.asarray(design, dtype=np.float64)
+    if (y.ndim != 1 or y.size == 0 or offset.shape != y.shape or
+            design.shape != (y.size, 2)):
+        raise ValueError('y and offset must be nonempty vectors and design must have two columns')
+    if any(not np.all(np.isfinite(x)) or np.any(x < 0.0)
+           for x in (y, offset, design)):
+        raise ValueError('y, offset, and design must be finite and nonnegative')
+    if not np.isfinite(precision) or precision < 0.0:
+        raise ValueError('precision must be finite and nonnegative')
+    if not isinstance(maxiter, (int, np.integer)) or isinstance(maxiter, bool) or maxiter < 1:
+        raise ValueError('maxiter must be a positive integer')
+    if initial_fit is None:
+        initial_fit = fit_nb_identity(y, offset, design)
+    if not isinstance(initial_fit, NBFit):
+        raise TypeError('initial_fit must be an NBFit instance')
+    rates0 = np.asarray(initial_fit.rates, dtype=np.float64)
+    if (rates0.shape != (2,) or not np.all(np.isfinite(rates0)) or
+            np.any(rates0 < P_BOUNDS[0]) or np.any(rates0 > P_BOUNDS[1])):
+        raise ValueError('initial_fit rates must satisfy the probability bounds')
+    if np.isnan(initial_fit.phi) or initial_fit.phi <= 0.0:
+        raise ValueError('initial_fit phi must be positive')
+    if precision == 0.0:
+        return initial_fit
+    log_phi = np.log(np.clip(initial_fit.phi, np.exp(LOG_PHI_BOUNDS[0]),
+                             np.exp(LOG_PHI_BOUNDS[1])))
+    baseline_theta = np.r_[np.log(rates0), log_phi]
+    baseline_value = _regularized_nll_and_grad(
+        baseline_theta, y, offset, design, precision)[0]
+    common = np.clip(np.maximum(y - offset, 0.0).sum() /
+                     max(float(design.sum()), MU_FLOOR), *P_BOUNDS)
+    starts = [baseline_theta, np.r_[np.repeat(np.log(common), 2), log_phi]]
+    bounds = [(np.log(P_BOUNDS[0]), np.log(P_BOUNDS[1]))] * 2 + [LOG_PHI_BOUNDS]
+    results = [minimize(_regularized_nll_and_grad, start,
+                        args=(y, offset, design, precision), method='L-BFGS-B',
+                        jac=True, bounds=bounds,
+                        options={'maxiter': maxiter, 'ftol': 1e-11,
+                                 'gtol': 1e-7, 'maxls': 40})
+               for start in starts]
+    successful = [r for r in results if r.success and np.isfinite(r.fun)
+                  and np.all(np.isfinite(r.x)) and r.fun <= baseline_value]
+    used_fallback = False
+    if not any(r.success and np.isfinite(r.fun) for r in results):
+        finite = [r for r in results if np.isfinite(r.fun) and np.all(np.isfinite(r.x))]
+        start = min(finite, key=lambda r: r.fun).x if finite else baseline_theta
+        fallback = minimize(
+            lambda theta: _regularized_nll_and_grad(theta, y, offset, design, precision)[0],
+            start, method='Powell', bounds=bounds,
+            options={'maxiter': 400, 'xtol': 1e-8, 'ftol': 1e-11})
+        results.append(fallback)
+        if (fallback.success and np.isfinite(fallback.fun) and
+                np.all(np.isfinite(fallback.x)) and fallback.fun <= baseline_value):
+            successful.append(fallback)
+            used_fallback = True
+    if not successful:
+        return NBFit(rates=rates0.copy(), phi=float(initial_fit.phi),
+                     loglik=nb_loglik(y, offset + design @ rates0, initial_fit.phi),
+                     success=False, status='nonconvergence:regularized_baseline_fallback',
+                     nit=sum(int(getattr(r, 'nit', 0)) for r in results))
+    result = min(successful, key=lambda r: r.fun)
+    rates, phi = np.exp(result.x[:2]), float(np.exp(result.x[2]))
+    return NBFit(rates=rates, phi=phi,
+                 loglik=nb_loglik(y, offset + design @ rates, phi), success=True,
+                 status='regularized_log_rr:powell_fallback' if used_fallback else 'regularized_log_rr',
+                 nit=int(result.nit))
+
+
+def regularized_parameter_intervals(fit, offset, design, *, precision=1.0,
+                                    confidence=0.95, covariance='sandwich') -> FixedTauWaldIntervals:
+    """Experimental first-order intervals for a fixed-precision NB2 fit.
+
+    In log-risk coordinates let I be NB expected information, c=(-1,1),
+    and A=I+precision*c*c.T. The default covariance is A^-1 I A^-1,
+    transformed to risk coordinates. ``covariance='unpenalized'`` instead
+    uses inverse NB information at the supplied fit as a diagnostic.
+    Returned ``information`` remains NB information in risk coordinates.
+    These finite-penalty approximations ignore shrinkage bias and do not
+    guarantee nominal coverage after change-date selection or alarm stopping.
+    Singular information raises LinAlgError, as in ordinary fixed-tau intervals.
+    """
+    from dataclasses import replace
+
+    if not np.isfinite(precision) or precision < 0.0:
+        raise ValueError('precision must be finite and nonnegative')
+    if covariance not in ('sandwich', 'unpenalized'):
+        raise ValueError("covariance must be 'sandwich' or 'unpenalized'")
+    if np.any(np.asarray(offset) < 0.0) or np.any(np.asarray(design) < 0.0):
+        raise ValueError('offset and design must be nonnegative')
+    # Weak information can overflow ordinary RR endpoints before their
+    # replacement below; infinite endpoints remain meaningful diagnostics.
+    with np.errstate(over='ignore'):
+        ordinary = fixed_tau_parameter_intervals(fit, offset, design, confidence=confidence)
+    if precision == 0.0 or covariance == 'unpenalized':
+        return ordinary
+    rates = ordinary.rates
+    information_log = rates[:, None] * ordinary.information * rates[None, :]
+    contrast = np.array([-1.0, 1.0])
+    adjusted = information_log + precision * np.outer(contrast, contrast)
+    inverse = np.linalg.inv(adjusted)
+    covariance_log = inverse @ information_log @ inverse.T
+    covariance_risk = rates[:, None] * covariance_log * rates[None, :]
+    covariance_risk = 0.5 * (covariance_risk + covariance_risk.T)
+    diagonal = np.diag(covariance_risk)
+    contrast_variance = float(contrast @ covariance_log @ contrast)
+    if (not np.all(np.isfinite(covariance_risk)) or np.any(diagonal < 0.0)
+            or not np.isfinite(contrast_variance) or contrast_variance < 0.0):
+        raise np.linalg.LinAlgError('regularized covariance has invalid variances')
+    z = float(norm.ppf(0.5 + confidence / 2.0))
+    se = np.sqrt(diagonal) / (rates * (1.0 - rates))
+    lower = ordinary.cfr_logit - z * se
+    upper = ordinary.cfr_logit + z * se
+    rr_se = float(np.sqrt(contrast_variance))
+    rr_lower = ordinary.log_risk_ratio - z * rr_se
+    rr_upper = ordinary.log_risk_ratio + z * rr_se
+    return replace(ordinary, covariance=covariance_risk,
+                   cfr_logit_standard_errors=se, cfr_logit_lower=lower,
+                   cfr_logit_upper=upper, cfr_lower=expit(lower), cfr_upper=expit(upper),
+                   log_risk_ratio_standard_error=rr_se,
+                   log_risk_ratio_lower=rr_lower, log_risk_ratio_upper=rr_upper,
+                   risk_ratio_lower=float(np.exp(rr_lower)),
+                   risk_ratio_upper=float(np.exp(rr_upper)))
+
 # Source section: single_change_gp.py
 """Single-change negative-binomial CFR score scan.
 
@@ -1171,6 +1585,57 @@ def exposure_components(cases: Sequence[float], delay_pmf: Sequence[float], *, l
     post = reverse_sum[:, 1:n]
     return (np.ascontiguousarray(total), np.ascontiguousarray(post))
 
+def nishiura_two_stage_moments(cases: Sequence[float], deaths: Sequence[int | float],
+                             delay_pmf: Sequence[float], *, tau: int,
+                             alarm: int | None = None) -> dict:
+    """Delay-adjusted two-stage moment points at a supplied OCFR candidate.
+
+    ``tau`` uses the existing OCFR candidate convention: the post-cohort
+    exposure is column ``tau-1`` of :func:`exposure_components`. The report
+    split uses indices below ``tau`` for the first stage and all remaining
+    observed indices for the second. ``alarm`` is an inclusive zero-based
+    report index. No future observations enter either calculation.
+
+    This Nishiura-inspired reference is a moment construction, not a fitted
+    NB likelihood or a reproduction of a published change-point procedure.
+    Finite negative and greater-than-one points are returned without clipping;
+    arithmetic availability and probability admissibility are separate fields.
+    Missing denominators return ``None``. No intervals are constructed.
+    """
+    c, y = _validate_stream(cases, deaths)
+    end = c.size - 1 if alarm is None else alarm
+    if not isinstance(end, (int, np.integer)) or not 2 <= end < c.size:
+        raise ValueError('alarm must index an observed prefix of length at least three')
+    if not isinstance(tau, (int, np.integer)) or not 1 <= tau < end + 1:
+        raise ValueError('tau must be an OCFR candidate within the observed prefix')
+    c, y = c[:end + 1], y[:end + 1]
+    total, post = exposure_components(c, delay_pmf)
+    b = post[:, tau - 1]
+    cut = tau
+    pre_exposure = float(np.sum(total[:cut]))
+    post_exposure = float(np.sum(b[cut:]))
+    contamination = float(np.sum(total[cut:] - b[cut:]))
+    left = float(np.sum(y[:cut]) / pre_exposure) if pre_exposure > 0 else None
+    right = ((float(np.sum(y[cut:])) - left * contamination) / post_exposure
+             if left is not None and post_exposure > 0 else None)
+    ratio = right / left if right is not None and left != 0 else None
+    result = {'pre_exposure': pre_exposure, 'post_exposure': post_exposure,
+              'pre_contamination': contamination}
+    for target, value in (('pi_left', left), ('pi_right', right), ('risk_ratio', ratio)):
+        finite = value is not None and bool(np.isfinite(value))
+        result[target + '_estimate'] = value if finite else None
+        result[target + '_point_valid'] = finite
+        result[target + '_admissible'] = bool(finite and
+            (0 <= value <= 1 if target != 'risk_ratio' else
+             value >= 0 and left > 0 and left <= 1 and 0 <= right <= 1))
+    result['status'] = ('missing_pre_exposure' if pre_exposure <= 0 else
+                        'missing_post_exposure' if post_exposure <= 0 else
+                        'zero_pre_risk' if left == 0 else
+                        'success' if all(result[t + '_point_valid'] for t in
+                            ('pi_left', 'pi_right', 'risk_ratio')) else 'nonfinite_arithmetic')
+    return result
+
+
 def _fit_score_null_from_exposure(deaths: np.ndarray, exposure: np.ndarray, *, observation_start: int) -> NullScoreFit:
     """Fit the NB2 null from a validated, precomputed exposure vector."""
     positive = (exposure > MU_FLOOR) & (np.arange(exposure.size, dtype=np.int64) >= int(observation_start))
@@ -1239,7 +1704,7 @@ def _score_scan_c(cases: Sequence[float], deaths: Sequence[int | float], delay_p
     c, d = _validate_stream(cases, deaths)
     if not isinstance(candidate_start, (int, np.integer)) or candidate_start < 1 or candidate_start >= c.size:
         raise ValueError('candidate_start must lie inside the supplied prefix')
-    kernels = FastKernels()
+    kernels = _get_native_kernels()
     exposure, post = kernels.gp_exposure_components(c, validate_delay_pmf(delay_pmf), lag_offset=lag_offset)
     fit = _fit_score_null_from_exposure(d, exposure, observation_start=observation_start)
     empty = np.empty(0, dtype=np.float64)
@@ -1278,11 +1743,15 @@ def report_day_score_scan(
     *,
     observation_start: int = 0,
     use_lindeberg_gate: bool = True,
+    initial_candidates: Sequence[int] | None = None,
 ) -> ScoreScan:
     """Matched report-day score ablation for cohort alignment.
 
     The fitted null mean, dispersion, observation prefix, nuisance direction,
-    and candidate grid are inherited from ``aligned_scan``.  Only the change
+    are inherited from ``aligned_scan``. By default the retained candidate
+    grid is inherited as in the legacy implementation. Supply
+    ``initial_candidates`` to apply this direction's own information screen
+    to the same initial calendar grid used for the cohort direction. The change
     direction differs: candidate ``tau`` scales report-day exposure from
     calendar day ``tau`` onward instead of aligning deaths to originating case
     cohorts.  This makes the contrast interpretable as an alignment ablation,
@@ -1290,7 +1759,13 @@ def report_day_score_scan(
     """
     fit = aligned_scan.null_fit
     d = np.asarray(deaths, dtype=np.float64)
-    candidates = np.asarray(aligned_scan.candidates, dtype=np.int64)
+    supplied = aligned_scan.candidates if initial_candidates is None else initial_candidates
+    raw_candidates = np.asarray(supplied)
+    if raw_candidates.ndim != 1 or not np.all(np.isfinite(raw_candidates)) or not np.all(raw_candidates == np.floor(raw_candidates)):
+        raise ValueError("initial candidates must be a one-dimensional integer grid")
+    candidates = np.asarray(raw_candidates, dtype=np.int64)
+    if np.any(candidates < 1) or np.any(candidates >= d.size) or np.unique(candidates).size != candidates.size:
+        raise ValueError("initial candidates must be unique indices inside the supplied prefix")
     empty = np.empty(0, dtype=np.float64)
     if not fit.success or candidates.size == 0:
         return ScoreScan(candidates=np.empty(0, dtype=np.int64), z=empty, q=empty,
@@ -1382,20 +1857,30 @@ def multiplier_statistics_from_draws(multipliers: Sequence[Sequence[float]], inf
         return np.full(draws.shape[0], np.nan, dtype=np.float64)
     if backend in {'auto', 'c'}:
         try:
-            return FastKernels().multiplier_maxima(draws, weights)
+            return _get_native_kernels().multiplier_maxima(draws, weights)
         except (OSError, RuntimeError, AttributeError):
             if backend == 'c':
                 raise
     gaussian_process = draws @ weights
     return np.max(np.square(gaussian_process), axis=1)
 
-def multiplier_statistics(scan: ScoreScan, n_multiplier: int, rng: np.random.Generator, *, backend: str='c') -> np.ndarray:
-    """Generate NumPy multipliers and transform them into squared GP suprema."""
+def multiplier_statistics(scan: ScoreScan, n_multiplier: int, rng: np.random.Generator | None, *, backend: str='c', multipliers: np.ndarray | None=None) -> np.ndarray:
+    """Transform Gaussian multipliers, optionally reusing supplied common draws.
+
+    A supplied matrix must be ``(n_multiplier, prefix_length)``. This permits
+    one episode draw matrix to be restricted to each successive prefix.
+    """
     if n_multiplier < 19:
         raise ValueError('n_multiplier must be at least 19')
     if scan.candidates.size == 0:
         return np.full(n_multiplier, np.nan, dtype=np.float64)
-    multipliers = rng.standard_normal((n_multiplier, scan.influence.shape[0]))
+    shape = (n_multiplier, scan.influence.shape[0])
+    if multipliers is None:
+        if rng is None:
+            raise ValueError('rng is required when multipliers are not supplied')
+        multipliers = rng.standard_normal(shape)
+    elif np.asarray(multipliers).shape != shape:
+        raise ValueError('supplied multipliers have the wrong shape')
     return multiplier_statistics_from_draws(multipliers, scan.influence, backend=backend)
 
 def monte_carlo_critical_value(values: Sequence[float], alpha: float) -> float:
@@ -1443,20 +1928,98 @@ def bonferroni_boundary(horizon: int, alpha: float=0.05, look_every: int=7) -> t
     threshold = float(chi2.ppf(1.0 - alpha / n_tests, df=1))
     return (threshold, looks, n_tests)
 
-class OnlineGaussianProcessScore:
-    """Online one-change detector with a numerical GP boundary.
+import math
+GAUSSIAN_SPENDING_POLICY = 'gaussian-first-crossing-linear-support-discard-v1'
 
-    Each scheduled look uses a current-prefix Gaussian multiplier quantile at
-    level ``alpha / J``. If the look-specific working approximation attains
-    that local level, Bonferroni's inequality gives the episode-level bound
-    without a cross-look dependence model or spending-shape parameter. The
-    detector never constructs a future score or exposure.
+
+@dataclass(frozen=True)
+class BoundaryLook:
+    look: int
+    cumulative_alpha: float
+    rank: int
+    boundary: float
+    available: bool
+    resolved: bool
+    eligible_before: int
+    eligible_after: int
+    discarded_now: int
+    support_discarded_now: int
+    strict_crossed_now: int
+    strict_crossed_total: int
+    support_discarded_total: int
+    boundary_ties: int
+
+
+class GaussianSpendingBoundary:
+    def __init__(self, n_paths: int, n_looks: int, alpha: float):
+        if isinstance(n_paths, bool) or not isinstance(n_paths, (int, np.integer)) or n_paths < 1:
+            raise ValueError('n_paths must be a positive integer')
+        if isinstance(n_looks, bool) or not isinstance(n_looks, (int, np.integer)) or n_looks < 1:
+            raise ValueError('n_looks must be a positive integer')
+        if not 0 < alpha < 1:
+            raise ValueError('alpha must lie in (0, 1)')
+        self.n_paths, self.n_looks, self.alpha = int(n_paths), int(n_looks), float(alpha)
+        self.eligible = np.ones(n_paths, dtype=bool)
+        self.strict_crossed = np.zeros(n_paths, dtype=bool)
+        self.support_discarded = np.zeros(n_paths, dtype=bool)
+        self.look = 0
+
+    def advance(self, maxima=None, *, available=True) -> BoundaryLook:
+        if self.look >= self.n_looks:
+            raise ValueError('all planned looks already consumed')
+        # Validate before mutating; malformed inputs are programming failures.
+        x = None
+        if available:
+            x = np.asarray(maxima, dtype=float)
+            if x.shape != (self.n_paths,) or not np.all(np.isfinite(x)):
+                raise ValueError('maxima must be one finite value per fixed reference path')
+        self.look += 1
+        budget = self.alpha * self.look / self.n_looks
+        rank = math.ceil((1-budget) * (self.n_paths+1))
+        before = int(self.eligible.sum())
+        resolved = bool(available and rank <= before)
+        boundary = float(np.partition(x[self.eligible], rank-1)[rank-1]) if resolved else math.inf
+        discarded = support = crossed = ties = 0
+        if resolved:
+            strict_now = x > boundary
+            crossed = int(np.sum(strict_now & ~self.strict_crossed))
+            self.strict_crossed |= strict_now  # Includes previously removed supports.
+            support_now = self.eligible & (x == boundary)
+            ties = support = int(support_now.sum())
+            self.support_discarded |= support_now
+            remove = self.eligible & (x >= boundary)
+            discarded = int(remove.sum())
+            self.eligible[remove] = False
+        return BoundaryLook(self.look, budget, rank, boundary, bool(available), resolved,
+                            before, int(self.eligible.sum()), discarded, support, crossed,
+                            int(self.strict_crossed.sum()), int(self.support_discarded.sum()), ties)
+
+
+LEGACY_GAUSSIAN_POLICY = "online_gaussian_process_bonferroni_looks"
+
+class OnlineGaussianProcessScore:
+    """Prefix-only one-change detector with fixed-bank Gaussian spending.
+
+    The default removes boundary supports from future calibration eligibility;
+    observed alarms remain strict. The finite-bank theorem is a reference-law
+    statement, not exact fitted-count error control. The explicit legacy policy
+    retains the original alpha/J boundary for historical reproduction.
     """
 
-    def __init__(self, delay_pmf: Sequence[float], *, horizon: int, alpha: float=0.05, look_every: int=7, n_multiplier: int=10000, rng: np.random.Generator, use_lindeberg_gate: bool=True, backend: str='c') -> None:
+    def __init__(self, delay_pmf: Sequence[float], *, horizon: int, alpha: float=0.05, look_every: int=7, n_multiplier: int=10000, rng: np.random.Generator, use_lindeberg_gate: bool=True, backend: str='c', boundary_policy: str=GAUSSIAN_SPENDING_POLICY, planned_looks: Sequence[int] | None=None) -> None:
         if n_multiplier < 399:
             raise ValueError('n_multiplier must be at least 399')
         _, looks, _ = bonferroni_boundary(horizon, alpha, look_every)
+        if planned_looks is not None:
+            looks = tuple(planned_looks)
+            if (not looks or any(isinstance(x, bool) or not isinstance(x, (int, np.integer)) for x in looks)
+                    or tuple(sorted(set(looks))) != looks or looks[0] < 3 or looks[-1] > horizon):
+                raise ValueError("planned_looks must be strictly increasing prefix lengths in [3, horizon]")
+        if boundary_policy not in {GAUSSIAN_SPENDING_POLICY, LEGACY_GAUSSIAN_POLICY}:
+            raise ValueError("unknown Gaussian boundary policy")
+        self._boundary_policy = boundary_policy
+        self._boundary_state = GaussianSpendingBoundary(n_multiplier, len(looks), alpha)
+        self.last_boundary_look = None
         self._delay = validate_delay_pmf(delay_pmf)
         self._horizon = int(horizon)
         self._alpha = float(alpha)
@@ -1466,7 +2029,7 @@ class OnlineGaussianProcessScore:
         if backend not in {'auto', 'python', 'c'}:
             raise ValueError("backend must be 'auto', 'python', or 'c'")
         self._backend = backend
-        self._multipliers = np.ascontiguousarray(rng.standard_normal((int(n_multiplier), int(horizon))), dtype=np.float64)
+        self._multipliers = np.ascontiguousarray(gaussian_multiplier_bank(rng, (int(n_multiplier), int(horizon)), normal_mode="pcg32-numpy-box-muller-v1" if boundary_policy == GAUSSIAN_SPENDING_POLICY else "scalar"), dtype=np.float64)
         self._crossed = np.zeros(int(n_multiplier), dtype=bool)
         self._cases: list[float] = []
         self._deaths: list[float] = []
@@ -1478,7 +2041,7 @@ class OnlineGaussianProcessScore:
 
     @property
     def boundary_method(self) -> str:
-        return 'online_gaussian_process_bonferroni_looks'
+        return self._boundary_policy
 
     def update(self, cases_today: float, deaths_today: int | float) -> GaussianOnlineResult:
         if self._stopped:
@@ -1493,16 +2056,25 @@ class OnlineGaussianProcessScore:
         self._deaths.append(death)
         prefix = len(self._cases)
         look_index = self._look_to_index.get(prefix)
+        if look_index is not None and prefix < 3 and self._boundary_policy == GAUSSIAN_SPENDING_POLICY:
+            self.last_boundary_look = self._boundary_state.advance(available=False)
         if look_index is None or prefix < 3:
             return GaussianOnlineResult(day=prefix - 1, is_look=False, alarm=False, statistic=np.nan, threshold=np.inf, estimated_change_day=None, direction=0, pi_hat=np.nan, phi_hat=np.nan, n_candidates=0, cumulative_alpha=0.0, numerical_crossing_probability=float(np.mean(self._crossed)), status='not_a_scheduled_look')
         per_look_alpha = self._alpha / len(self._looks_ordered)
         cumulative_alpha = look_index * per_look_alpha
         scan = score_scan(self._cases, self._deaths, self._delay, use_lindeberg_gate=self._gate, backend=self._backend)
-        if not scan.null_fit.success or scan.candidates.size == 0:
+        if not scan.null_fit.success or scan.candidates.size == 0 or not np.isfinite(scan.statistic):
+            if self._boundary_policy == GAUSSIAN_SPENDING_POLICY:
+                self.last_boundary_look = self._boundary_state.advance(available=False)
             return GaussianOnlineResult(day=prefix - 1, is_look=True, alarm=False, statistic=scan.statistic, threshold=np.inf, estimated_change_day=None, direction=0, pi_hat=scan.null_fit.pi, phi_hat=scan.null_fit.phi, n_candidates=int(scan.candidates.size), cumulative_alpha=cumulative_alpha, numerical_crossing_probability=float(np.mean(self._crossed)), status=scan.null_fit.status)
         maxima = multiplier_statistics_from_draws(self._multipliers[:, :prefix], scan.influence, backend=self._backend)
-        threshold = monte_carlo_critical_value(maxima, per_look_alpha)
-        self._crossed |= maxima > threshold
+        if self._boundary_policy == GAUSSIAN_SPENDING_POLICY:
+            self.last_boundary_look = self._boundary_state.advance(maxima)
+            threshold = self.last_boundary_look.boundary
+            self._crossed = self._boundary_state.strict_crossed
+        else:
+            threshold = monte_carlo_critical_value(maxima, per_look_alpha)
+            self._crossed |= maxima > threshold
         alarm = bool(np.isfinite(scan.statistic) and scan.statistic > threshold)
         if alarm:
             self._stopped = True
@@ -1526,6 +2098,7 @@ class BenchmarkResult:
     estimated_calendar_change_day: int | None
     estimated_cohort_change_day: int | None
     direction: int
+    fit_status: str = "success"
 
 def _delay_median(delay_pmf: Sequence[float], lag_offset: int=1) -> int:
     probabilities = np.asarray(delay_pmf, dtype=np.float64)
@@ -1556,30 +2129,68 @@ def _baseline_residuals(cases: np.ndarray, deaths: np.ndarray, delay_pmf: np.nda
     return (residuals, mean, float(fit.pi), float(fit.phi))
 
 def _profile_nb_scale(y: np.ndarray, baseline_mean: np.ndarray, phi: float) -> tuple[float, float]:
-    """Profile a multiplicative NB mean shift with safeguarded Newton steps."""
+    """Maximize the NB scale likelihood via its strictly decreasing log-score.
+
+    Positive counts have a unique interior root in log scale. Zero counts have
+    the exact boundary maximum at scale zero. There are no arbitrary scale caps.
+    The LR uses the analytic likelihood difference, cancelling count constants.
+    """
     if y.size == 0:
         return (1.0, 0.0)
     mu = np.maximum(baseline_mean, MU_FLOOR)
-    gamma = float(np.clip(np.sum(y) / max(np.sum(mu), MU_FLOOR), 0.0001, 10000.0))
-    if np.isinf(phi) or phi >= 10000000.0:
-        fitted = gamma * mu
-        return (gamma, max(0.0, 2.0 * (nb_loglik(y, fitted, phi) - nb_loglik(y, mu, phi))))
-    for _ in range(40):
-        denominator = phi + gamma * mu
-        score = float(np.sum(y / gamma - (y + phi) * mu / denominator))
-        hessian = float(np.sum(-y / (gamma * gamma) + (y + phi) * mu * mu / denominator ** 2))
-        if not np.isfinite(score) or not np.isfinite(hessian) or hessian >= 0.0:
+    total_y, total_mu = float(np.sum(y)), float(np.sum(mu))
+    poisson = np.isinf(phi) or phi >= 10000000.0
+    if total_y == 0.0:
+        lr = 2.0 * (total_mu if poisson else float(np.sum(phi * np.log1p(mu / phi))))
+        return (0.0, lr)
+    eta = float(np.log(total_y) - np.log(total_mu))
+    if poisson:
+        gamma = float(np.exp(eta))
+        lr = 2.0 * (total_y * eta - (gamma - 1.0) * total_mu)
+        return (gamma, max(0.0, float(lr)))
+
+    def score_hessian(value):
+        fitted = np.exp(value) * mu
+        denominator = phi + fitted
+        score = float(np.sum(phi * (y - fitted) / denominator))
+        hessian = -float(np.sum((phi / denominator) * (fitted / denominator) * (phi + y)))
+        return score, hessian
+
+    step = 1.0
+    lower, upper = eta - step, eta + step
+    while score_hessian(lower)[0] < 0.0:
+        step *= 2.0
+        lower = eta - step
+    step = 1.0
+    while score_hessian(upper)[0] > 0.0:
+        step *= 2.0
+        upper = eta + step
+    for _ in range(100):
+        score, hessian = score_hessian(eta)
+        if score == 0.0:
             break
-        proposal = gamma - score / hessian
-        if proposal <= 1e-06 or proposal >= 1000000.0:
-            proposal = np.sqrt(gamma * np.clip(proposal, 1e-06, 1000000.0))
-        if abs(proposal - gamma) <= 1e-09 * (1.0 + gamma):
-            gamma = float(proposal)
+        if score > 0.0:
+            lower = eta
+        else:
+            upper = eta
+        proposal = eta - score / hessian if hessian < 0.0 else np.nan
+        if not np.isfinite(proposal) or not lower < proposal < upper:
+            proposal = 0.5 * (lower + upper)
+        if abs(proposal - eta) <= 2e-14 * (1.0 + abs(eta)):
+            eta = float(proposal)
             break
-        gamma = float(proposal)
-    gamma = float(np.clip(gamma, 1e-06, 1000000.0))
-    lr = 2.0 * (nb_loglik(y, gamma * mu, phi) - nb_loglik(y, mu, phi))
-    return (gamma, max(0.0, float(lr)))
+        eta = float(proposal)
+    gamma = float(np.exp(eta))
+    delta = (gamma - 1.0) * mu / (phi + mu)
+    # log1p(delta) avoids cancellation near the null; separate log1p terms
+    # remain stable when a very small scale makes delta round close to -1.
+    if np.any(delta < -0.5):
+        log_ratio = np.log1p(gamma * mu / phi) - np.log1p(mu / phi)
+    else:
+        log_ratio = np.log1p(delta)
+    lr = 2.0 * float(np.sum(y * eta - (y + phi) * log_ratio))
+    return (gamma, max(0.0, lr))
+
 
 def nb_surveillance_glr(cases: Sequence[float], deaths: Sequence[int | float], delay_pmf: Sequence[float], *, reference_end: int=28, observation_start: int=0, lag_offset: int=1) -> BenchmarkResult:
     """Window-unlimited two-sided NB intercept GLR.
@@ -1669,6 +2280,82 @@ def page_cusum(cases: Sequence[float], deaths: Sequence[int | float], delay_pmf:
         best_direction = -1
     lag = _delay_median(f, lag_offset)
     return BenchmarkResult(method='Page-CUSUM', day=c.size - 1, statistic=float(statistic), estimated_calendar_change_day=best_calendar, estimated_cohort_change_day=max(0, best_calendar - lag), direction=best_direction)
+
+def surveillance_benchmark_traces(
+    cases: Sequence[float], deaths: Sequence[int | float],
+    delay_pmf: Sequence[float], looks: Sequence[int], *,
+    reference_end: int = 28, allowance: float = 0.5, backend: str = 'c',
+) -> dict[str, list[BenchmarkResult]]:
+    """NB-GLR and Page statistics at prefix lengths, with one frozen fit.
+
+    Future outcomes are never used in the reference fit or in a prefix
+    statistic. Calculating the exposure once only uses the causal convolution.
+    This is equivalent to calling the two public charts on each prefix.
+    """
+    if backend not in {'c', 'python'}:
+        raise ValueError("backend must be 'c' or 'python'")
+    c, d = _validate_stream(cases, deaths)
+    prefixes = tuple(int(t) for t in looks)
+    if not prefixes or any(t <= reference_end or t > c.size for t in prefixes) or tuple(sorted(set(prefixes))) != prefixes:
+        raise ValueError("looks must be increasing prefix lengths after the reference segment")
+    if allowance < 0.0:
+        raise ValueError("allowance must be nonnegative")
+    f = validate_delay_pmf(delay_pmf)
+    try:
+        residuals, mean, _, phi = _baseline_residuals(c, d, f, reference_end)
+    except RuntimeError as exc:
+        status = f'unavailable:{exc}'
+        return {key: [BenchmarkResult(label, prefix - 1, np.nan, None, None, 0,
+                                     fit_status=status) for prefix in prefixes]
+                for key, label in (('NB-GLR', 'NB-surveillance-GLR'),
+                                   ('Page-CUSUM', 'Page-CUSUM'))}
+    lag = _delay_median(f)
+    results: dict[str, list[BenchmarkResult]] = {"NB-GLR": [], "Page-CUSUM": []}
+    if backend == 'c':
+        statistics, locations, directions = _get_native_kernels().surveillance_benchmark_traces(
+            d, mean, residuals, phi, reference_end, prefixes, allowance)
+        for j, prefix in enumerate(prefixes):
+            for column, key, label in ((0, 'NB-GLR', 'NB-surveillance-GLR'),
+                                        (1, 'Page-CUSUM', 'Page-CUSUM')):
+                calendar = int(locations[j, column])
+                results[key].append(BenchmarkResult(
+                    label, prefix - 1, float(statistics[j, column]), calendar,
+                    max(0, calendar - lag), int(directions[j, column])))
+        return results
+    positive = negative = 0.0
+    positive_start = negative_start = reference_end
+    previous = reference_end
+    for prefix in prefixes:
+        best_statistic, best_calendar, best_scale = -np.inf, reference_end, 1.0
+        for change in range(reference_end, prefix):
+            scale, statistic = _profile_nb_scale(d[change:prefix], mean[change:prefix], phi)
+            if statistic > best_statistic:
+                best_statistic, best_calendar, best_scale = statistic, change, scale
+        results["NB-GLR"].append(BenchmarkResult(
+            "NB-surveillance-GLR", prefix - 1, float(best_statistic), best_calendar,
+            max(0, best_calendar - lag), int(np.sign(best_scale - 1.0))))
+        for day in range(previous, prefix):
+            value = float(residuals[day])
+            if positive + value - allowance <= 0.0:
+                positive, positive_start = 0.0, day + 1
+            else:
+                positive += value - allowance
+            if negative - value - allowance <= 0.0:
+                negative, negative_start = 0.0, day + 1
+            else:
+                negative += -value - allowance
+        if positive <= 0.0 and negative <= 0.0:
+            statistic, calendar, direction = 0.0, prefix - 1, 0
+        elif positive >= negative:
+            statistic, calendar, direction = positive, positive_start, 1
+        else:
+            statistic, calendar, direction = negative, negative_start, -1
+        results["Page-CUSUM"].append(BenchmarkResult(
+            "Page-CUSUM", prefix - 1, float(statistic), calendar,
+            max(0, calendar - lag), direction))
+        previous = prefix
+    return results
+
 
 def published_benchmark_statistics(cases: Sequence[float], deaths: Sequence[int | float], delay_pmf: Sequence[float], *, reference_end: int=28, observation_start: int=0, lag_offset: int=1) -> dict[str, BenchmarkResult]:
     """Evaluate all locked comparator statistics on one observed prefix.
@@ -2074,22 +2761,97 @@ def assert_backend_parity(seed: int = 20260914) -> dict[str, object]:
 
 __all__ = [
     'BenchmarkResult', 'CSampler', 'FixedLookResult', 'FixedTauWaldIntervals',
-    'GaussianOnlineResult', 'METHOD_REGISTRY', 'NBFit', 'NullScoreFit',
+    'GaussianOnlineResult', 'METHOD_REGISTRY', 'NBFit', 'PoissonFit', 'LSFit', 'NullScoreFit',
     'OnlineGaussianProcessScore', 'PythonSampler', 'ScoreScan',
     'apply_ascertainment_shift', 'apply_fixed_reporting_lag',
     'apply_weekend_transfer', 'assert_backend_parity', 'backend_parity_report',
     'bimodal_delay_pmf', 'binomial_interval', 'bonferroni_boundary',
     'build_native', 'convolved_exposure', 'episode_metrics',
-    'exposure_components', 'fast_available', 'fit_nb_identity',
+    'exposure_components', 'fast_available', 'fit_nb_identity', 'fit_poisson_identity', 'fit_ls_identity',
+    'fit_nb_regularized_identity', 'regularized_parameter_intervals',
     'fit_nb_rates_fixed_phi', 'fit_score_null', 'fixed_look_test',
     'fixed_tau_parameter_intervals', 'fixed_tau_wald_intervals',
     'focus_working_model', 'gamma_delay_pmf', 'gradual_cfr_path',
     'lognormal_delay_pmf', 'make_cases', 'make_correlated_epidemic_cases',
     'make_sampler', 'means_from_cfr_path', 'monte_carlo_critical_value',
     'multiplier_statistics', 'multiplier_statistics_from_draws', 'nb_loglik',
-    'nb_surveillance_glr', 'nb_variance', 'page_cusum',
+    'nb_surveillance_glr', 'nb_variance', 'nishiura_two_stage_moments', 'page_cusum',
     'paired_binary_difference_interval', 'published_benchmark_statistics',
-    'sampler_backend_available', 'score_scan',
+    'sampler_backend_available', 'score_scan', 'surveillance_benchmark_traces',
     'simulate_deaths_with_dispersion_path', 'simulate_nb_deaths',
     'validate_delay_pmf',
 ]
+
+
+def pcg_uint32_from_state(state: int, increment: int, n: int) -> np.ndarray:
+    if n == 0:
+        return np.empty(0, dtype=np.uint32)
+    states = np.empty(n, dtype=np.uint64)
+    states[0] = state
+    step, a, c = 1, 6364136223846793005, increment
+    # F^(2k)(s) = a_k^2*s + (a_k+1)*c_k, modulo 2^64.
+    # Each doubling block copies the earlier states advanced by that block size.
+    with np.errstate(over='ignore'):
+        while step < n:
+            count = min(step, n-step)
+            states[step:step+count] = states[:count]*np.uint64(a)+np.uint64(c)
+            c = ((a+1)*c) & _MASK64
+            a = (a*a) & _MASK64
+            step *= 2
+    shift = ((states >> np.uint64(18)) ^ states) >> np.uint64(27)
+    shift &= np.uint64((1 << 32)-1)
+    rotation = states >> np.uint64(59)
+    output = (shift >> rotation) | (shift << ((np.uint64(32)-rotation) & np.uint64(31)))
+    return (output & np.uint64((1 << 32)-1)).astype(np.uint32)
+
+
+GAUSSIAN_BANK_CHUNK_NORMALS = 100_000
+
+
+def _pcg32_advance_state(state: int, increment: int, n_words: int) -> int:
+    """Advance an LCG state by affine exponentiation modulo 2**64."""
+    multiplier, addition = 6364136223846793005, increment
+    accumulated_multiplier, accumulated_addition = 1, 0
+    while n_words:
+        if n_words & 1:
+            accumulated_multiplier = (accumulated_multiplier * multiplier) & _MASK64
+            accumulated_addition = (accumulated_addition * multiplier + addition) & _MASK64
+        addition = ((multiplier + 1) * addition) & _MASK64
+        multiplier = (multiplier * multiplier) & _MASK64
+        n_words >>= 1
+    return (accumulated_multiplier * state + accumulated_addition) & _MASK64
+
+
+def gaussian_multiplier_bank(rng, shape, *, normal_mode="scalar"):
+    """Generate a bank without changing count/scalar RNG behavior.
+
+    The Python batch mode bounds temporary arrays to 100,000 normals while
+    retaining the full output bank. Chunk boundaries use exact affine PCG32
+    jumps; one bank consumes one sampler stream, including an empty bank.
+    NumPy elementary functions agree with the scalar PCG32 Box-Muller reference
+    within floating-point tolerance, not general bitwise C parity.
+    """
+    if normal_mode not in {"scalar", "pcg32-numpy-box-muller-v1"}:
+        raise ValueError("unknown multiplier normal mode")
+    if normal_mode == "scalar" or not isinstance(rng, PythonSampler):
+        return rng.standard_normal(shape)
+    dimensions = tuple(shape) if isinstance(shape, (tuple, list)) else (shape,)
+    if any(isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer))
+           or value < 0 for value in dimensions):
+        raise ValueError("bank shape entries must be nonnegative integers")
+    dimensions = tuple(int(value) for value in dimensions)
+    values = np.empty(dimensions, dtype=np.float64)
+    flat = values.reshape(-1)
+    generator = rng._generator()
+    state = generator.state
+    for start in range(0, flat.size, GAUSSIAN_BANK_CHUNK_NORMALS):
+        count = min(GAUSSIAN_BANK_CHUNK_NORMALS, flat.size-start)
+        words = pcg_uint32_from_state(state, generator.increment, 2*count)
+        uniforms = (words.astype(np.float64)+.5)/4294967296.
+        flat[start:start+count] = np.sqrt(-2.*np.log(uniforms[::2])) * np.cos((2.*math.pi)*uniforms[1::2])
+        state = _pcg32_advance_state(state, generator.increment, 2*count)
+        del words, uniforms
+    return values
+
+__all__ += ['BoundaryLook', 'GaussianSpendingBoundary', 'GAUSSIAN_SPENDING_POLICY',
+            'LEGACY_GAUSSIAN_POLICY', 'gaussian_multiplier_bank', 'pcg_uint32_from_state']
