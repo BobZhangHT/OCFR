@@ -444,3 +444,8 @@ def get_dispersion_sensitivity_config(base: ExperimentConfig) -> ExperimentConfi
         motivation="prespecified dispersion sensitivity under correct mean")
         for phi in (5, 10, 20, 40) for rr in (1., 1.5))
     return replace(base, master_seed=2026111604, scenarios=cells, split_replications=None)
+
+
+PAIRED_DETECTION_VERSION = "compact-v2-paired-detection-v1"
+ORACLE_OCFR = "OCFR-oracle"
+PAIRED_DETECTION_METHODS = ("OCFR", ORACLE_OCFR, "NB-GLR", "Page-CUSUM")

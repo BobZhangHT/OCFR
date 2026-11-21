@@ -31,6 +31,7 @@ import pandas as pd
 from PIL import Image
 from scipy.stats import beta, binom, t as student_t
 from scipy.special import expit, logit
+from config import ORACLE_OCFR, PAIRED_DETECTION_METHODS as COMPACT_PAIRED_METHODS
 
 
 RAW_FILE = "replicate_results.csv"
@@ -776,6 +777,23 @@ COMPACT_COLORS["OCFR"] = COMPACT_COLORS["OCFR Gaussian"]
 COMPACT_MARKERS["OCFR"] = COMPACT_MARKERS["OCFR Gaussian"]
 COMPACT_LINESTYLES["OCFR"] = COMPACT_LINESTYLES["OCFR Gaussian"]
 
+COMPACT_COLORS[ORACLE_OCFR] = "#163D62"
+COMPACT_MARKERS[ORACLE_OCFR] = "s"
+COMPACT_LINESTYLES[ORACLE_OCFR] = "--"
+COMPACT_PAIRED_LINEWIDTHS = {"OCFR": 2.2, ORACLE_OCFR: 1.15}
+COMPACT_PAIRED_LABELS = {"OCFR": "Practical OCFR", ORACLE_OCFR: "Oracle OCFR",
+                         "Page-CUSUM": "Page CUSUM"}
+
+
+def _compact_method_handles(methods: Sequence[str]) -> list[plt.Line2D]:
+    paired = ORACLE_OCFR in methods
+    return [plt.Line2D([], [], color=COMPACT_COLORS[method], marker=COMPACT_MARKERS[method],
+                      linestyle=COMPACT_LINESTYLES[method], markersize=4,
+                      linewidth=COMPACT_PAIRED_LINEWIDTHS.get(method) if paired else None,
+                      label=COMPACT_PAIRED_LABELS.get(method, method) if paired else method)
+            for method in methods]
+
+
 def compact_binomial_interval(k: int, n: int) -> tuple[float, float]:
     """Two-sided 95% Clopper--Pearson interval, including boundary cases."""
     if n < 1 or not 0 <= k <= n:
@@ -869,6 +887,11 @@ def _compact_load_stage(directory: Path, stage: str) -> tuple[pd.DataFrame, dict
         for column in ("case_seed", "death_seed"):
             if column in group and (group.groupby("replicate")[column].nunique(dropna=False) != 1).any():
                 raise EvidenceError(f"{scenario}: methods do not share paired {column} streams")
+    return _compact_episode_metrics(frame), manifest
+
+
+def _compact_episode_metrics(frame: pd.DataFrame) -> pd.DataFrame:
+    """Convert zero-based episode indices and compute first-alarm indicators."""
     for column in ("alarm_day", "true_change", "horizon", "risk_ratio"):
         converted = pd.to_numeric(frame[column], errors="coerce")
         if (frame[column].notna() & converted.isna()).any():
@@ -899,7 +922,7 @@ def _compact_load_stage(directory: Path, stage: str) -> tuple[pd.DataFrame, dict
     frame["premature"] = frame.alternative & alarm & (frame.alarm_day < frame.change_day)
     frame["useful"] = frame.alternative & alarm & (frame.alarm_day >= frame.change_day)
     frame["delay"] = np.where(frame.useful, frame.alarm_day-frame.change_day, np.nan)
-    return frame, manifest
+    return frame
 
 
 
@@ -1163,11 +1186,20 @@ def compact_summaries(frame: pd.DataFrame) -> dict[str, pd.DataFrame]:
                                  pd.Series(0, index=subset.index)), errors="coerce").fillna(0).sum())})
     for (stage, scenario), group in frame.groupby(["stage", "scenario"], sort=True):
         common = {column: group[column].iloc[0] for column in metadata}
-        for metric, column in (("alarm_probability", "any_alarm"), ("useful_power", "useful")):
+        metrics = [("alarm_probability", "any_alarm"), ("useful_power", "useful")]
+        if ORACLE_OCFR in set(group.method) and group.alternative.iloc[0]:
+            group = group.assign(timely28=group.useful & group.delay.le(28))
+            metrics.append(("useful_detection_within_28", "timely28"))
+            if group.misspecification.iloc[0] == "on_model" and "tau_hat_at_alarm" in group:
+                cohort_error = (pd.to_numeric(group.tau_hat_at_alarm, errors="coerce") - group.true_change).abs()
+                group = group.assign(joint7=group.useful & cohort_error.le(7))
+                metrics.append(("useful_detection_localized_within_7", "joint7"))
+        for metric, column in metrics:
             if metric == "useful_power" and not group.alternative.iloc[0]:
                 continue
             pivot = group.pivot(index="replicate", columns="method", values=column)
-            methods = [method for method in (("OCFR", "NB-GLR", "Page-CUSUM") if "OCFR" in pivot else COMPACT_METHOD_ORDER) if method in pivot]
+            order = COMPACT_PAIRED_METHODS if "OCFR" in pivot else COMPACT_METHOD_ORDER
+            methods = [method for method in order if method in pivot]
             for i, first in enumerate(methods):
                 for second in methods[i+1:]:
                     difference = pivot[first].astype(float)-pivot[second].astype(float)
@@ -1189,6 +1221,7 @@ def compact_localization_summaries(frame: pd.DataFrame) -> pd.DataFrame:
         raise EvidenceError("v2 localization requires stored first-alarm cohort dates")
     selected = frame[frame.stage.eq("evaluation") & frame.alternative &
                      frame.misspecification.eq("on_model")]
+    paired = selected.method.eq(ORACLE_OCFR).any()
     rows = []
     for (scenario, method), group in selected.groupby(["scenario", "method"], sort=True):
         useful = group[group.useful]
@@ -1200,18 +1233,29 @@ def compact_localization_summaries(frame: pd.DataFrame) -> pd.DataFrame:
         mean = float(error.mean()) if n else np.nan
         mcse = float(error.std(ddof=1) / np.sqrt(n)) if n > 1 else np.nan
         half = float(student_t.ppf(.975, n-1) * mcse) if n > 1 else np.nan
-        rows.append(dict(scenario=scenario, method=method, family=group.family.iloc[0],
+        row = dict(scenario=scenario, method=method, family=group.family.iloc[0],
             risk_ratio=float(group.risk_ratio.iloc[0]), change_day=int(group.change_day.iloc[0]),
             n_requested=len(group), n_useful=n, mean_absolute_error_days=mean,
             mcse=mcse, mc_ci_low=max(0., mean-half) if n > 1 else np.nan,
             mc_ci_high=mean+half if n > 1 else np.nan,
-            location_convention=("selected cohort change date" if method == "OCFR" else
+            location_convention=("selected cohort change date" if method in ("OCFR", ORACLE_OCFR) else
                 "prespecified median-delay cohort proxy"),
-            denominator="method-specific useful first alarms"))
+            denominator="method-specific useful first alarms")
+        if paired:
+            normal_half = 1.96 * mcse
+            joint = _compact_probability(group.useful & (
+                (pd.to_numeric(group.tau_hat_at_alarm, errors="coerce") - group.true_change).abs() <= 7))
+            row.update(normal_ci_low=max(0., mean-normal_half) if n > 1 else np.nan,
+                       normal_ci_high=mean+normal_half, joint_events=joint["events"],
+                       joint_estimate=joint["estimate"], joint_ci_low=joint["ci_low"],
+                       joint_ci_high=joint["ci_high"], joint_denominator="all requested episodes")
+        rows.append(row)
     return pd.DataFrame(rows)
 
 
 def _compact_localization_figure(table: pd.DataFrame, directory: Path) -> str:
+    if table.method.eq(ORACLE_OCFR).any():
+        return _compact_paired_localization_figure(table, directory)
     fig, axes = plt.subplots(3, 1, figsize=(6.4, 7.4), sharex=True)
     methods = ("OCFR", "NB-GLR", "Page-CUSUM")
     ratios = np.array([2/3, 1.25, 1.5, 2.])
@@ -1253,6 +1297,48 @@ def _compact_localization_figure(table: pd.DataFrame, directory: Path) -> str:
         "at least two detections are available; singleton estimates have no bar and zero-detection "
         "cells have no point. Requested-episode and useful-detection counts accompany the numerical summaries. "
         "This conditional localization comparison is separate from useful detection probability.")
+
+
+def _compact_paired_localization_figure(table: pd.DataFrame, directory: Path) -> str:
+    fig, axes = plt.subplots(2, 3, figsize=(6.8, 5), sharex=True, sharey="row")
+    ratios = np.array([2/3, 1.25, 1.5, 2.])
+    methods = COMPACT_PAIRED_METHODS
+    for column, family in enumerate(("steady", "sparse", "wave")):
+        family_rows = table[table.family.eq(family) & table.change_day.eq(92)]
+        for index, method in enumerate(methods):
+            part = family_rows[family_rows.method.eq(method)].sort_values("risk_ratio")
+            if len(part) != len(ratios) or not np.allclose(part.risk_ratio, ratios):
+                raise EvidenceError(f"localization requires the day-92 risk-ratio grid for {family}/{method}")
+            x = np.arange(len(ratios)) + (index - (len(methods) - 1)/2) * .12
+            for ax, fields in zip(axes[:, column], (
+                    ("mean_absolute_error_days", "normal_ci_low", "normal_ci_high"),
+                    ("joint_estimate", "joint_ci_low", "joint_ci_high"))):
+                mean, lo, hi = part[list(fields)].to_numpy(float).T
+                color, marker = COMPACT_COLORS[method], COMPACT_MARKERS[method]
+                ax.plot(x, mean, color=color, marker=marker, markersize=3.8,
+                        linestyle=COMPACT_LINESTYLES[method])
+                valid = np.isfinite(lo) & np.isfinite(hi)
+                ax.errorbar(x[valid], mean[valid],
+                    yerr=np.vstack([mean[valid] - lo[valid], hi[valid] - mean[valid]]),
+                    fmt="none", color=color, capsize=2, elinewidth=.95)
+        axes[0, column].set_title(family.capitalize())
+        axes[1, column].set(ylim=(0, 1.02), xlabel="CFR risk ratio")
+        axes[1, column].set_xticks(np.arange(4), ["2/3", "1.25", "1.5", "2"])
+    axes[0, 0].set_ylabel("Conditional mean absolute\ncohort-date error (days)")
+    axes[0, 0].set_ylim(bottom=0)
+    axes[1, 0].set_ylabel("Useful alarm and localization\nwithin 7 days (probability)")
+    for letter, ax in zip("ABCDEF", axes.flat):
+        _compact_letter(ax, letter)
+    fig.legend(handles=_compact_method_handles(methods), ncol=4, loc="upper center",
+               bbox_to_anchor=(.54, .996), fontsize=9.5, frameon=False)
+    fig.subplots_adjust(left=.155, right=.98, bottom=.12, top=.87, hspace=.34, wspace=.31)
+    _compact_save(fig, directory, "CompactFig4_localization")
+    return ("Columns show steady, sparse and wave incidence with changes on day 92. "
+        "A-C: mean absolute cohort-date error among each method's useful first alarms, "
+        "with approximate 95% normal Monte Carlo intervals. D-F: probability of a useful "
+        "first alarm localized within seven days, with exact 95% binomial Monte Carlo "
+        "intervals and all requested episodes in the denominator. Both OCFR rules use "
+        "their selected cohort date; report-day benchmarks use the median-delay cohort proxy.")
 
 
 ESTIMATION_TARGETS = ("pi_left", "pi_right", "risk_ratio")
@@ -2154,7 +2240,8 @@ def _compact_letter(ax: plt.Axes, letter: str) -> None:
 
 
 def _compact_probability_panel(ax: plt.Axes, data: pd.DataFrame, xcolumn: str,
-                               methods=COMPACT_MAIN_METHODS, xlabels=None) -> None:
+                               methods=COMPACT_MAIN_METHODS, xlabels=None, *,
+                               connect_categories: bool = False) -> None:
     for index, method in enumerate(methods):
         subset = data[data.method == method].sort_values(xcolumn)
         if subset.empty:
@@ -2170,8 +2257,10 @@ def _compact_probability_panel(ax: plt.Axes, data: pd.DataFrame, xcolumn: str,
             ax.errorbar(x, branch.estimate,
                 yerr=np.vstack([branch.estimate-branch.ci_low, branch.ci_high-branch.estimate]),
                 fmt=COMPACT_MARKERS[method],
-                linestyle=(COMPACT_LINESTYLES[method] if xlabels is None and
+                linestyle=(COMPACT_LINESTYLES[method] if (xlabels is None or connect_categories) and
                     (xcolumn != "risk_ratio" or len(branch) > 1) else "none"),
+                linewidth=COMPACT_PAIRED_LINEWIDTHS.get(method) if ORACLE_OCFR in methods else None,
+                elinewidth=1.1 if ORACLE_OCFR in methods else None,
                 markersize=3.5, color=COMPACT_COLORS[method], capsize=2,
                 label=method if branch_index == 0 else None)
     if xlabels is not None:
@@ -2226,6 +2315,8 @@ def _compact_export_metadata(directory: Path, names: Sequence[str], *,
 
 def _compact_v2_detection_figure(power: pd.DataFrame, curves: pd.DataFrame, directory: Path) -> str:
     """Five data axes, with method colors separate from the OCFR timing styles."""
+    if power.method.eq(ORACLE_OCFR).any():
+        return _compact_paired_detection_figure(power, curves, directory)
     fig = plt.figure(figsize=(6.4, 5.8))
     grid = fig.add_gridspec(2, 6)
     magnitude = [fig.add_subplot(grid[0, start:start+2]) for start in (0, 2, 4)]
@@ -2275,6 +2366,59 @@ def _compact_v2_detection_figure(power: pd.DataFrame, curves: pd.DataFrame, dire
         "data; method and timing legends are separate.")
 
 
+def _compact_paired_detection_figure(power: pd.DataFrame, curves: pd.DataFrame,
+                                     directory: Path) -> str:
+    """Separate change dates into panels so all curves share one method encoding."""
+    methods = COMPACT_PAIRED_METHODS
+    fig, axes = plt.subplots(3, 3, figsize=(6.8, 7.4))
+    ratios = np.array([2/3, 1.25, 1.5, 2.])
+    for ax, family in zip(axes[0], ("steady", "sparse", "wave")):
+        subset = power[power.family.eq(family) & power.change_day.eq(92)]
+        for method in methods:
+            values = np.sort(subset.loc[subset.method.eq(method), "risk_ratio"])
+            if len(values) != len(ratios) or not np.allclose(values, ratios):
+                raise EvidenceError(f"detection requires the day-92 risk-ratio grid for {family}/{method}")
+        _compact_probability_panel(ax, subset, "risk_ratio", methods=methods,
+                                   xlabels=dict(zip(sorted(subset.risk_ratio.unique()),
+                                                    ("2/3", "1.25", "1.5", "2"))),
+                                   connect_categories=True)
+        ax.set(xlabel="CFR risk ratio", title=family.capitalize())
+    for row, family in enumerate(("steady", "wave"), start=1):
+        for ax, day in zip(axes[row], (47, 92, 137)):
+            subset = curves[curves.stage.eq("evaluation") & curves.family.eq(family) &
+                curves.misspecification.eq("on_model") & curves.change_day.eq(day) &
+                np.isclose(curves.risk_ratio, 1.5) & curves.delay_day.le(45)]
+            for method in methods:
+                series = subset[subset.method.eq(method)].sort_values("delay_day")
+                if not np.array_equal(series.delay_day.to_numpy(), np.arange(46)):
+                    raise EvidenceError(f"missing 45-day detection curve for {family}/day {day}/{method}")
+                ax.step(series.delay_day, series.estimate, where="post",
+                        color=COMPACT_COLORS[method], linestyle=COMPACT_LINESTYLES[method],
+                        linewidth=COMPACT_PAIRED_LINEWIDTHS.get(method))
+            ax.set(xlim=(0, 45), ylim=(0, 1.02), xticks=[0, 15, 30, 45],
+                   title=f"{family.capitalize()}, day {day}")
+            if row == 2:
+                ax.set_xlabel("Days after change")
+    axes[0, 0].set_ylabel("Useful detection\nprobability")
+    for ax in axes[1:, 0]:
+        ax.set_ylabel("Cumulative useful\ndetection probability")
+    for letter, ax in zip("ABCDEFGHI", axes.flat):
+        ax.set_yticks([0, .25, .5, .75, 1.])
+        ax.tick_params(labelleft=ax in axes[:, 0])
+        _compact_letter(ax, letter)
+    fig.legend(handles=_compact_method_handles(methods), loc="upper center", ncol=4,
+               bbox_to_anchor=(.54, .996), fontsize=9.5, frameon=False)
+    fig.subplots_adjust(left=.15, right=.98, bottom=.09, top=.885, hspace=.74, wspace=.32)
+    _compact_save(fig, directory, "CompactFig3_detection")
+    return ("A-C: useful first-alarm probability across CFR risk ratios with change day 92 "
+        "in steady, sparse and wave incidence. Lines join the increases. Bars are exact "
+        "95% binomial Monte Carlo intervals. D-F and G-I: cumulative useful detection "
+        "in steady and wave incidence, respectively, for a change on day 47, 92 or 137 "
+        "at RR=1.5, with 45 days of follow-up. Pointwise exact intervals accompany the "
+        "curves in the data table. Every denominator includes all requested episodes; "
+        "premature and absent first alarms contribute zero.")
+
+
 def _compact_dispersion_grid(summary, methods):
     expected = {(float(phi), float(rr), method, metric)
         for phi in (5, 10, 20, 40) for rr in (1., 1.5) for method in methods
@@ -2287,7 +2431,8 @@ def _compact_dispersion_grid(summary, methods):
 
 def _compact_dispersion_companions(dispersion, directory):
     directory.mkdir(parents=True, exist_ok=True)
-    methods = _compact_method_contract("compact-v2", "evaluation")
+    methods = (COMPACT_PAIRED_METHODS if dispersion.method.eq(ORACLE_OCFR).any()
+               else _compact_method_contract("compact-v2", "evaluation"))
     fig, ax = plt.subplots(figsize=(4.8, 3.5))
     null = dispersion[dispersion.metric.eq("alarm_probability") & np.isclose(dispersion.risk_ratio, 1.)]
     _compact_probability_panel(ax, null, "phi", methods=methods)
@@ -2296,7 +2441,7 @@ def _compact_dispersion_companions(dispersion, directory):
     ax.set(xlabel=r"NB dispersion $\phi$", ylabel="Null alarm probability",
            ylim=(0, max(.10, 1.08 * null.ci_high.max())))
     ax.axhline(.05, color=".4", linestyle="--", linewidth=.8)
-    ax.legend(fontsize=9.5)
+    ax.legend(handles=_compact_method_handles(methods), fontsize=9.5)
     fig.subplots_adjust(left=.18, right=.97, bottom=.22, top=.96)
     name = "CompactFigS2_dispersion_null"
     _compact_save(fig, directory, name)
@@ -2312,24 +2457,39 @@ def _compact_sensitivity_figure(evaluation: pd.DataFrame, directory: Path, *,
                                 protocol: str = "compact-v2", has_estimation: bool = False,
                                 dispersion: pd.DataFrame | None = None) -> tuple[str, str]:
     """Plot validated base or extended sensitivity rows on their actual grids."""
-    main_methods = _compact_method_contract(protocol, "evaluation")[:4]
-    handles = [plt.Line2D([], [], color=COMPACT_COLORS[m], marker=COMPACT_MARKERS[m],
-               linestyle=COMPACT_LINESTYLES[m], markersize=4, label=m) for m in main_methods]
+    paired = evaluation.method.eq(ORACLE_OCFR).any()
+    main_methods = (COMPACT_PAIRED_METHODS if paired
+                    else _compact_method_contract(protocol, "evaluation")[:4])
+    handles = _compact_method_handles(main_methods)
     directory.mkdir(parents=True, exist_ok=True)
     _compact_style()
     fig, axes = plt.subplots(2, 2, figsize=(6.4, 6.8))
     wave = evaluation[evaluation.family == "wave"].copy()
     wave["delay_setting"] = wave["true_delay_mean_days"] if "true_delay_mean_days" in wave else wave.scenario.str.extract(r"delay(\d+)", expand=False).fillna("14").astype(float)
     delay_ticks = sorted(wave.loc[wave.misspecification.isin(("on_model", "delay_error")), "delay_setting"].unique())
+    if paired and delay_ticks != list(range(11, 18)):
+        raise EvidenceError("paired sensitivity requires the complete seven-cell delay grid")
     # The correct-model control and perturbations share frozen thresholds.
     for ax, metric in zip(axes[0], ("alarm_probability", "useful_power")):
         subset = wave[(wave.misspecification.isin(("on_model", "delay_error"))) &
             (wave.metric == metric) & (wave.change_day == 92) &
             (np.isclose(wave.risk_ratio, 1. if metric == "alarm_probability" else 1.5))]
-        _compact_probability_panel(ax, subset, "delay_setting", methods=main_methods)
-        ax.set(xlabel="Underlying Gamma mean (days)", ylabel="False-alarm probability" if metric == "alarm_probability" else "Useful detection\nprobability", xticks=delay_ticks)
+        if paired:
+            expected = {(method, day) for method in main_methods for day in delay_ticks}
+            actual = list(subset[["method", "delay_setting"]].itertuples(index=False, name=None))
+            if set(actual) != expected or len(actual) != len(expected):
+                raise EvidenceError(f"paired sensitivity has an incomplete delay grid for {metric}")
+            labels = {day: f"{day:g}" for day in delay_ticks}
+            _compact_probability_panel(ax, subset, "delay_setting", methods=main_methods,
+                                       xlabels=labels, connect_categories=True)
+        else:
+            _compact_probability_panel(ax, subset, "delay_setting", methods=main_methods)
+            ax.set_xticks(delay_ticks)
+        ax.set(xlabel="Underlying Gamma mean (days)", ylabel="False-alarm probability" if metric == "alarm_probability" else "Useful detection\nprobability")
         if metric == "alarm_probability":
             ax.axhline(.05, color=".4", linestyle="--", linewidth=.8)
+            if paired:
+                ax.set_ylim(0, max(.10, 1.08 * subset.ci_high.max()))
     # Separate the two outcomes so close operating points cannot obscure one
     # another. DGP is a labelled category; method retains the global encoding.
     inner = axes[1, 0].get_subplotspec().subgridspec(1, 2, wspace=1.0)
@@ -2340,8 +2500,9 @@ def _compact_sensitivity_figure(evaluation: pd.DataFrame, directory: Path, *,
             ("alarm_probability", "useful_power"), (1., 1.5),
             ("False alarms", "Useful detection"),
             ("Null probability", "Power (RR=1.5)")):
+        ci_high = []
         for index, method in enumerate(main_methods):
-            offset = (index-(len(main_methods)-1)/2)*.22
+            offset = (index-(len(main_methods)-1)/2)*(.16 if paired else .22)
             for x, setting in enumerate(("on_model", "cohort_binomial")):
                 rows = wave[wave.method.eq(method) & wave.misspecification.eq(setting) &
                     wave.change_day.eq(92) & wave.metric.eq(metric) &
@@ -2349,6 +2510,7 @@ def _compact_sensitivity_figure(evaluation: pd.DataFrame, directory: Path, *,
                 if len(rows) != 1:
                     raise EvidenceError("sensitivity comparison requires one row per DGP, method and outcome")
                 row = rows.iloc[0]
+                ci_high.append(row.ci_high)
                 ax.errorbar(x+offset, row.estimate,
                     yerr=[[row.estimate-row.ci_low], [row.ci_high-row.estimate]],
                     fmt=COMPACT_MARKERS[method], color=COMPACT_COLORS[method],
@@ -2362,8 +2524,12 @@ def _compact_sensitivity_figure(evaluation: pd.DataFrame, directory: Path, *,
         ax.title.set_fontsize(9)
         ax.yaxis.label.set_fontsize(9)
         if metric == "alarm_probability":
-            ax.set_ylim(0, .10)
-            ax.set_yticks([0, .05, .10], ["0", ".05", ".10"])
+            upper = max(.10, 1.08 * max(ci_high)) if paired else .10
+            ax.set_ylim(0, upper)
+            if upper == .10:
+                ax.set_yticks([0, .05, .10], ["0", ".05", ".10"])
+            else:
+                ax.yaxis.set_major_locator(MaxNLocator(nbins=3))
             ax.axhline(.05, color=".4", linestyle="--", linewidth=.8)
         else:
             ax.set_ylim(0, 1.02)
@@ -2390,7 +2556,9 @@ def _compact_sensitivity_figure(evaluation: pd.DataFrame, directory: Path, *,
         if letter == "C":
             # Retain the outer-panel letter alignment after dividing its width.
             ax.texts[-1].set_x(-.48)
-    fig.legend(handles=handles, ncol=len(main_methods) if protocol == "compact-v2" else 2, loc="upper center", bbox_to_anchor=(.53,.998))
+    fig.legend(handles=handles, ncol=len(main_methods) if protocol == "compact-v2" else 2,
+               loc="upper center", bbox_to_anchor=(.53,.998),
+               frameon=not paired, fontsize=9.5 if paired else 10.5)
     fig.subplots_adjust(left=.16, right=.97, bottom=.1, top=.91 if protocol == "compact-v2" else .87, hspace=.51, wspace=.57)
     sensitivity_name = "CompactFig6_sensitivity" if protocol == "compact-v2" or has_estimation else "CompactFig5_sensitivity"
     _compact_save(fig, directory, sensitivity_name)
@@ -2415,7 +2583,76 @@ def _compact_sensitivity_figure(evaluation: pd.DataFrame, directory: Path, *,
             "true and assumed delay means are 14 days. Original phi10 benchmark cutoffs are retained. "
             "All four null-error settings are audited in the reproducibility diagnostics. "
             "Power compares complete frozen procedures, not tests adjusted to identical Type I error. ")
+    if paired:
+        caption = caption.replace(
+            f"Benchmark cutoffs remain fixed at reference values; {primary} recomputes its boundaries using the same declared rule.",
+            "Oracle OCFR and benchmark cutoffs stay fixed at reference-wave values. "
+            "Practical OCFR recomputes its boundaries using the declared spending rule.")
+        caption = caption.replace("Original phi10 benchmark cutoffs are retained. ",
+            "The original oracle and benchmark cutoffs calibrated at phi=10 are retained. ").replace(
+            "Power compares complete frozen procedures, not tests adjusted to identical Type I error.",
+            "Power compares procedures at their achieved false-alarm rates.")
     return sensitivity_name, caption
+
+
+def _compact_comparison_figure(
+    audit: pd.DataFrame, curves: pd.DataFrame, directory: Path, *, protocol: str
+) -> None:
+    """Render the reference audit and detection curves from their summary tables."""
+    paired = audit.method.eq(ORACLE_OCFR).any()
+    main_methods = (COMPACT_PAIRED_METHODS if paired
+                    else _compact_method_contract(protocol, "evaluation")[:4])
+    handles = _compact_method_handles(main_methods)
+    fig, axes = plt.subplots(2, 2, figsize=(6.4, 6.9))
+    ax = axes[0, 0]
+    for i, family in enumerate(("steady", "sparse", "wave")):
+        for j, method in enumerate(main_methods):
+            row = audit[(audit.family == family) & (audit.method == method)]
+            if len(row) != 1:
+                raise EvidenceError(f"expected one independent audit row for {family}/{method}")
+            row = row.iloc[0]
+            y = i+(j-(len(main_methods)-1)/2)*.15
+            ax.errorbar(row.estimate, y,
+                xerr=[[row.estimate-row.ci_low], [row.ci_high-row.estimate]],
+                fmt=COMPACT_MARKERS[method], color=COMPACT_COLORS[method], capsize=2,
+                markersize=3.5)
+    ax.axvline(.05, color=".35", linestyle="--", linewidth=.9)
+    ax.set_yticks(range(3), ["Steady", "Sparse", "Wave"])
+    ax.set_xlabel("Episode false-alarm probability")
+    if paired:
+        ax.xaxis.set_major_locator(MaxNLocator(nbins=5, steps=[1, 2, 2.5, 5, 10]))
+        ax.xaxis.set_major_formatter(FuncFormatter(lambda x, _: f"{x:.3f}"))
+    ax.invert_yaxis()
+    for ax, family in zip(axes.flat[1:], ("steady", "sparse", "wave")):
+        subset = curves[(curves.stage == "evaluation") & (curves.family == family) &
+            (curves.misspecification == "on_model") & (curves.change_day == 92) &
+            np.isclose(curves.risk_ratio, 1.5)]
+        for method in main_methods:
+            row = subset[subset.method == method].sort_values("delay_day")
+            ax.step(row.delay_day, row.estimate, where="post", color=COMPACT_COLORS[method],
+                    linestyle=COMPACT_LINESTYLES[method],
+                    linewidth=COMPACT_PAIRED_LINEWIDTHS.get(method) if paired else None)
+            if protocol == "compact-v2":
+                day28 = row[row.delay_day.eq(28)]
+                if len(day28) != 1:
+                    raise EvidenceError("day-28 comparison requires one validated curve value")
+                ax.plot(28, float(day28.iloc[0].estimate), linestyle="none",
+                        marker=COMPACT_MARKERS[method], color=COMPACT_COLORS[method],
+                        markersize=6 if paired and method == "OCFR" else 4, zorder=4,
+                        markerfacecolor="none" if paired and method == "OCFR" else COMPACT_COLORS[method])
+        if protocol == "compact-v2":
+            ax.axvline(28, color=".65", linestyle=":", linewidth=.8, zorder=0)
+            ax.set_xticks([0, 28, 56, 84])
+        ax.set(xlim=(0,90), ylim=(0,1.02), xlabel="Days after change", ylabel="Cumulative detection\nprobability")
+    for letter, ax in zip("ABCD", axes.flat):
+        _compact_letter(ax, letter)
+    legend_columns = len(handles) if protocol == "compact-v2" else 2
+    fig.legend(handles=handles, ncol=legend_columns, loc="upper center",
+               bbox_to_anchor=(.53, .998), frameon=not paired,
+               fontsize=9.5 if paired else 10.5)
+    top = .90 if protocol == "compact-v2" else .87
+    fig.subplots_adjust(left=.16, right=.97, bottom=.09, top=top, hspace=.51, wspace=.57)
+    _compact_save(fig, directory, "CompactFig2_comparison")
 
 
 def _compact_figures(tables: dict[str, pd.DataFrame], directory: Path, *, protocol: str = "compact-v1") -> dict[str, str]:
@@ -2438,47 +2675,7 @@ def _compact_figures(tables: dict[str, pd.DataFrame], directory: Path, *, protoc
                          linestyle=COMPACT_LINESTYLES[m], markersize=4, label=m)
                          for m in main_methods]
     captions = {}
-    fig, axes = plt.subplots(2, 2, figsize=(6.4, 6.9))
-    ax = axes[0, 0]
-    for i, family in enumerate(("steady", "sparse", "wave")):
-        for j, method in enumerate(main_methods):
-            row = audit[(audit.family == family) & (audit.method == method)]
-            if len(row) != 1:
-                raise EvidenceError(f"expected one independent audit row for {family}/{method}")
-            row = row.iloc[0]
-            y = i+(j-(len(main_methods)-1)/2)*.15
-            ax.errorbar(row.estimate, y,
-                xerr=[[row.estimate-row.ci_low], [row.ci_high-row.estimate]],
-                fmt=COMPACT_MARKERS[method], color=COMPACT_COLORS[method], capsize=2,
-                markersize=3.5)
-    ax.axvline(.05, color=".35", linestyle="--", linewidth=.9)
-    ax.set_yticks(range(3), ["Steady", "Sparse", "Wave"])
-    ax.set_xlabel("Episode false-alarm probability")
-    ax.invert_yaxis()
-    for ax, family in zip(axes.flat[1:], ("steady", "sparse", "wave")):
-        subset = curves[(curves.stage == "evaluation") & (curves.family == family) &
-            (curves.misspecification == "on_model") & (curves.change_day == 92) &
-            np.isclose(curves.risk_ratio, 1.5)]
-        for method in main_methods:
-            row = subset[subset.method == method]
-            ax.step(row.delay_day, row.estimate, where="post", color=COMPACT_COLORS[method],
-                    linestyle=COMPACT_LINESTYLES[method])
-            if protocol == "compact-v2":
-                day28 = row[row.delay_day.eq(28)]
-                if len(day28) != 1:
-                    raise EvidenceError("day-28 comparison requires one validated curve value")
-                ax.plot(28, float(day28.iloc[0].estimate), linestyle="none",
-                        marker=COMPACT_MARKERS[method], color=COMPACT_COLORS[method],
-                        markersize=4, zorder=4)
-        if protocol == "compact-v2":
-            ax.axvline(28, color=".65", linestyle=":", linewidth=.8, zorder=0)
-            ax.set_xticks([0, 28, 56, 84])
-        ax.set(xlim=(0,90), ylim=(0,1.02), xlabel="Days after change", ylabel="Cumulative detection\nprobability")
-    for letter, ax in zip("ABCD", axes.flat):
-        _compact_letter(ax, letter)
-    fig.legend(handles=handles, ncol=2, loc="upper center", bbox_to_anchor=(.53, .998))
-    fig.subplots_adjust(left=.16, right=.97, bottom=.09, top=.87, hspace=.51, wspace=.57)
-    _compact_save(fig, directory, "CompactFig2_comparison")
+    _compact_comparison_figure(audit, curves, directory, protocol=protocol)
     captions["CompactFig2_comparison"] = (
         "A: independent null audit in the steady, sparse, and wave incidence families; dashed line: "
         "nominal 0.05. B–D: cumulative useful first-alarm probability "
@@ -3914,6 +4111,206 @@ def analyze_sensitivity_extension(base_output: Path, extension_output: Path, *,
     return tables
 
 
+def _load_paired_detection_stage(output: Path, stage: str) -> tuple[pd.DataFrame, dict]:
+    from config import PAIRED_DETECTION_VERSION
+
+    directory = output / stage
+    manifest = json.loads((directory / MANIFEST_FILE).read_text(encoding="utf-8"))
+    if (manifest.get("protocol") != PAIRED_DETECTION_VERSION
+            or manifest.get("stage") != stage or manifest.get("status") != "complete"):
+        raise EvidenceError(f"{directory}: expected complete paired detection evidence")
+    path = directory / RAW_FILE
+    if _sha256(path) != _manifest_file_hash(manifest, RAW_FILE):
+        raise EvidenceError(f"{directory}: replicate hash mismatch")
+    frame = pd.read_csv(path, float_precision="round_trip",
+                        dtype={"case_hash": "string", "death_hash": "string"})
+    required = {"scenario", "family", "method", "replicate", "status", "split",
+                "null_family", "case_hash", "death_hash", "raw_episode_max"}
+    if stage != "calibration":
+        required |= {"alarm_day", "tau_hat_at_alarm", "true_change", "horizon",
+                     "risk_ratio", "misspecification", "critical_value"}
+    if not required.issubset(frame.columns) or frame.empty:
+        raise EvidenceError(f"{directory}: missing paired evidence fields {sorted(required - set(frame))}")
+    if frame.duplicated(["scenario", "replicate", "method"]).any():
+        raise EvidenceError(f"{directory}: duplicated episode-method records")
+    expected_methods = set(COMPACT_PAIRED_METHODS)
+    if stage == "calibration":
+        expected_methods.remove("OCFR")
+    if set(manifest["methods"]) != expected_methods:
+        raise EvidenceError(f"{directory}: paired method contract disagrees with stage")
+    counts = manifest["replications_by_scenario"]
+    definitions = manifest["scientific_config"]["scenarios"]
+    expected_splits = {
+        "calibration": {"calibration"}, "audit": {"size_audit"},
+        "evaluation": {"holdout", "alternative"},
+        "sensitivity-extension": {"holdout", "alternative"},
+        "dispersion-sensitivity": {"alternative"},
+    }
+    expected_names = {s["name"] for s in definitions if s["split"] in expected_splits[stage]}
+    if set(frame.scenario) != set(counts) or set(counts) != expected_names:
+        raise EvidenceError(f"{directory}: paired scenario roster disagrees with manifest")
+    for name, group in frame.groupby("scenario", sort=False):
+        n = counts[name]
+        split = str(group.split.iloc[0])
+        if (type(n) is not int or n != _compact_declared_n(manifest, split)
+                or set(group.method) != expected_methods):
+            raise EvidenceError(f"{directory}/{name}: invalid replication or method roster")
+        for _, episodes in group.groupby("method"):
+            if len(episodes) != n or set(episodes.replicate) != set(range(n)):
+                raise EvidenceError(f"{directory}/{name}: incomplete episode identifiers")
+        for key in ("case_hash", "death_hash"):
+            if group[key].isna().any() or group.groupby("replicate")[key].nunique().ne(1).any():
+                raise EvidenceError(f"{directory}/{name}: unpaired {key} streams")
+        metadata = ["family", "null_family", "split"]
+        if stage != "calibration":
+            metadata += ["true_change", "horizon", "risk_ratio", "misspecification"]
+        for key in metadata:
+            if group[key].nunique(dropna=False) != 1:
+                raise EvidenceError(f"{directory}/{name}: inconsistent {key}")
+    if not frame.status.eq("success").all():
+        raise EvidenceError(f"{directory}: incomplete or failed episode computation")
+    if stage == "calibration":
+        return frame, manifest
+    source_maxima = frame[frame.method.isin(("OCFR", ORACLE_OCFR))].pivot(
+        index=["scenario", "replicate"], columns="method", values="raw_episode_max")
+    practical, oracle = (pd.to_numeric(source_maxima[method], errors="coerce")
+                          for method in ("OCFR", ORACLE_OCFR))
+    if practical.isna().any() or np.isposinf(practical).any() or not np.array_equal(practical, oracle):
+        raise EvidenceError(f"{directory}: paired OCFR procedures do not share stored raw maxima")
+    return _compact_episode_metrics(frame), manifest
+
+
+def _validate_paired_thresholds(thresholds: pd.DataFrame, training: pd.DataFrame, alpha: float) -> dict:
+    keys = ["null_family", "method"]
+    if thresholds.duplicated(keys).any():
+        raise EvidenceError("paired thresholds contain duplicate family-method rows")
+    rows = thresholds.set_index(keys, verify_integrity=True)
+    if set(rows.index) != set(training.groupby(keys).groups):
+        raise EvidenceError("paired thresholds do not cover the calibration family-method grid")
+    cutoffs = {}
+    for key, group in training.groupby(keys):
+        maxima = pd.to_numeric(group.raw_episode_max, errors="coerce").to_numpy(float)
+        n = len(maxima)
+        rank = int(np.ceil((n + 1) * (1 - alpha)))
+        row = rows.loc[key]
+        if (np.isnan(maxima).any() or np.isposinf(maxima).any()
+                or row.n_calibration != n or row.order_rank != rank or not 1 <= rank <= n):
+            raise EvidenceError(f"{key}: invalid calibration maxima or order rank")
+        cutoff = np.partition(maxima, rank - 1)[rank - 1]
+        if not np.isfinite(cutoff) or cutoff != row.critical_value:
+            raise EvidenceError(f"{key}: calibration cutoff does not match the declared order statistic")
+        cutoffs[key] = cutoff
+    return cutoffs
+
+
+def analyze_paired_detection(output: Path, figure_dir: Path | None = None) -> dict[str, pd.DataFrame]:
+    """Summarize paired detector rules without consuming post-alarm estimation banks."""
+    output = Path(output).resolve()
+    destination = output / "analysis"
+    report_path = destination / "paired_detection_analysis_manifest.json"
+    report_path.unlink(missing_ok=True)
+    stages = ("calibration", "audit", "evaluation", "sensitivity-extension", "dispersion-sensitivity")
+    frames, manifests = {}, {}
+    for stage in stages:
+        frame, manifest = _load_paired_detection_stage(output, stage)
+        frame["evidence_stage"] = stage
+        frame["stage"] = "evaluation" if stage == "sensitivity-extension" else stage
+        frames[stage], manifests[stage] = frame, manifest
+
+    threshold_path = output / "calibration" / "thresholds.csv"
+    threshold_hash = _sha256(threshold_path)
+    calibration = manifests["calibration"]
+    if threshold_hash != _manifest_file_hash(calibration, threshold_path.name):
+        raise EvidenceError("paired calibration threshold hash mismatch")
+    digest = hashlib.sha256(_canonical_json({"protocol": calibration["protocol"],
+        "reference": calibration["source"], "scientific": calibration["scientific_config"]
+        }).encode("ascii")).hexdigest()[:20]
+    for stage, manifest in manifests.items():
+        if (manifest.get("scientific_digest") != digest or manifest.get("crossing") != "strict >"
+                or manifest.get("threshold_artifact", {}).get("sha256") != threshold_hash):
+            raise EvidenceError(f"{stage}: paired study identity or frozen threshold hash mismatch")
+    thresholds = pd.read_csv(threshold_path, float_precision="round_trip")
+    cutoffs = _validate_paired_thresholds(thresholds, frames["calibration"],
+                                        float(calibration["scientific_config"]["methods"]["alpha"]))
+    all_rows = pd.concat([frames[stage] for stage in stages[1:]], ignore_index=True)
+    if all_rows.duplicated(["stage", "scenario", "replicate", "method"]).any():
+        raise EvidenceError("paired stage union contains duplicate episodes")
+    for key, group in all_rows.groupby(["null_family", "method"]):
+        if not group.critical_value.eq(cutoffs.get(key, 0.)).all():
+            raise EvidenceError(f"{key}: evaluated threshold differs from the frozen cutoff")
+        if key[1] == ORACLE_OCFR and not group.raw_episode_max.gt(cutoffs[key]).eq(group.any_alarm).all():
+            raise EvidenceError(f"{key}: oracle alarms disagree with strict maximum crossing")
+    for stage, expected in (("audit", {"size_audit"}),
+                            ("evaluation", {"holdout", "alternative"}),
+                            ("sensitivity-extension", {"holdout", "alternative"}),
+                            ("dispersion-sensitivity", {"holdout", "alternative"})):
+        frame = frames[stage]
+        if set(frame.split) != expected or not np.array_equal(
+                frame.alternative, ~np.isclose(frame.risk_ratio, 1.)):
+            raise EvidenceError(f"{stage}: statistical split and risk-ratio truth disagree")
+    evaluation = all_rows[all_rows.stage.ne("dispersion-sensitivity")]
+    tables = compact_summaries(evaluation)
+    tables["compact_calibration"] = thresholds
+    tables["compact_localization"] = compact_localization_summaries(evaluation)
+    for name, table in compact_summaries(frames["dispersion-sensitivity"]).items():
+        tables[f"dispersion_{name}"] = table
+    dispersion = tables["dispersion_compact_summary"]
+    _compact_dispersion_grid(dispersion, COMPACT_PAIRED_METHODS)
+    tables["dispersion_null_audit"] = dispersion[dispersion.metric.eq("alarm_probability") &
+                                               np.isclose(dispersion.risk_ratio, 1.)]
+    tables["paired_detection_evidence_sources"] = all_rows.groupby(
+        ["evidence_stage", "stage", "scenario", "method"], as_index=False).agg(
+        requested_rows=("replicate", "size"))
+
+    figures = Path(figure_dir).resolve() if figure_dir is not None else destination / "figures"
+    figures.mkdir(parents=True, exist_ok=True)
+    _compact_style()
+    summary = tables["compact_summary"]
+    audit = summary[summary.stage.eq("audit") & summary.metric.eq("alarm_probability")]
+    evaluated = summary[summary.stage.eq("evaluation")]
+    power = evaluated[evaluated.misspecification.eq("on_model") & evaluated.metric.eq("useful_power")]
+    curves = tables["compact_cumulative_detection"]
+    _compact_comparison_figure(audit, curves, figures, protocol="compact-v2")
+    captions = {"CompactFig2_comparison": (
+        "A: independent null audit in each incidence family. Bars are exact 95% binomial Monte "
+        "Carlo intervals; dashed line marks .05. B-D: cumulative useful detection in steady, "
+        "sparse and wave incidence at RR=1.5 and change day 92. Markers show cumulative useful "
+        "detection within 28 days. Pointwise exact intervals accompany the curves in the data table.")}
+    captions["CompactFig3_detection"] = _compact_v2_detection_figure(power, curves, figures)
+    captions["CompactFig4_localization"] = _compact_localization_figure(tables["compact_localization"], figures)
+    name, caption = _compact_sensitivity_figure(evaluated, figures, dispersion=dispersion)
+    captions[name] = caption
+    companion_names = _compact_dispersion_companions(dispersion, figures)
+    evaluation_n = ", ".join(str(int(n)) for n in sorted(evaluated.n.unique()))
+    audit_n = ", ".join(str(int(n)) for n in sorted(audit.n.unique()))
+    dispersion_n = ", ".join(str(int(n)) for n in sorted(dispersion.n.unique()))
+    for name, caption in captions.items():
+        caption += f" Evaluation uses n={evaluation_n} independent episodes per condition."
+        if name == "CompactFig2_comparison":
+            caption += f" The independent null audit uses n={audit_n} episodes per family."
+        if name == "CompactFig6_sensitivity":
+            caption += f" The independent dispersion bank uses n={dispersion_n} episodes per condition."
+        (figures / f"{name}_caption.txt").write_text(caption + "\n", encoding="utf-8")
+
+    destination.mkdir(parents=True, exist_ok=True)
+    for name, table in tables.items():
+        _atomic_csv(table, destination / f"{name}.csv")
+    _atomic_json({"status": "complete", "analysis": "paired-detection",
+        "scientific_digest": digest, "thresholds_sha256": threshold_hash,
+        "methods": list(COMPACT_PAIRED_METHODS), "analysis_source_sha256": _sha256(Path(__file__)),
+        "confidence_level": .95, "probability_interval": "two-sided Clopper-Pearson",
+        "paired_uncertainty": "sample SD of within-episode indicator differences / sqrt(n)",
+        "probability_denominator": "all requested episodes",
+        "localization_mean_denominator": "each detector's useful first alarms",
+        "source_manifest_sha256": {stage: _sha256(output / stage / MANIFEST_FILE) for stage in stages},
+        "files": {f"{name}.csv": _sha256(destination / f"{name}.csv") for name in tables},
+        "figure_files": {f"{name}.pdf": _sha256(figures / f"{name}.pdf")
+                         for name in list(captions) + companion_names},
+        "publication_export": _compact_export_metadata(figures, list(captions) + companion_names,
+                                                       minimum_font_points=9)}, report_path)
+    return tables
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     base = Path(__file__).parent / "outputs"
@@ -3922,6 +4319,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--timely-window", type=int, default=28)
     parser.add_argument("--protocol", choices=("auto", "legacy", "compact-v1", "compact-v2"), default="auto")
     parser.add_argument("--figure-dir", type=Path, default=None)
+    parser.add_argument("--paired-detection", action="store_true",
+                        help="analyze the complete paired practical and oracle OCFR detection package")
     parser.add_argument("--sensitivity-extension", type=Path,
         help="combine a completed ten-cell sensitivity extension with --input parent study")
     parser.add_argument("--dispersion-study", type=Path, help="completed dispersion sensitivity study; requires --sensitivity-extension")
@@ -3947,6 +4346,16 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.paired_detection:
+        if any((args.sensitivity_extension, args.dispersion_study, args.base_code,
+                args.calibrate_intervals, args.apply_intervals, args.estimation_only,
+                args.ls_estimation_only, args.ls_main_figure)):
+            raise EvidenceError("paired detection analysis consumes the paired stage package only")
+        derived = analyze_paired_detection(args.input, figure_dir=args.figure_dir)
+        for name, table in derived.items():
+            print(f"{name}: {len(table)} derived rows")
+        print(f"wrote paired detection report to {(args.input / 'analysis').resolve()}")
+        return 0
     if args.sensitivity_extension is not None:
         if args.protocol in {"legacy", "compact-v1"} or any((args.calibrate_intervals,
                 args.apply_intervals, args.estimation_only, args.ls_estimation_only, args.ls_main_figure)):

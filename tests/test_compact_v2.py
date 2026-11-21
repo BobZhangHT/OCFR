@@ -77,6 +77,31 @@ def test_calibration_does_not_fit_scores(monkeypatch):
     assert [x['method'] for x in s._compact_evaluate_one(scene, 0, cfg, 'test')['rows']] == ['NB-GLR', 'Page-CUSUM']
 
 
+def test_paired_oracle_uses_first_strict_raw_crossing():
+    practical = {'method': 'OCFR', 'split': 'alternative', 'alarm_day': 55,
+                 'true_change': 49, 'horizon': 182}
+    cutoff = {'critical_value': 10., 'threshold_version': 'frozen'}
+    trace = [(34, -np.inf, None, 0), (41, 10., 35, 1), (48, 10.1, 40, -1), (55, 20., 50, 1)]
+
+    oracle = s._paired_oracle_record(practical, trace, cutoff, 28)
+
+    assert practical['alarm_day'] == 55
+    assert oracle['method'] == c.ORACLE_OCFR
+    assert (oracle['alarm_day'], oracle['tau_hat_at_alarm'], oracle['direction_at_alarm']) == (48, 40, -1)
+    assert (oracle['raw_episode_max'], oracle['max_day']) == (20., 55)
+    assert oracle['premature_alarm'] and not oracle['postchange_detection']
+    assert oracle['unavailable_looks'] == 1
+    assert not s._paired_oracle_record(practical, trace[:2], cutoff, 28)['alarm']
+
+
+def test_paired_detection_requires_dispersion_before_writing_outputs(tmp_path):
+    output = tmp_path / 'paired'
+    with pytest.raises(FileNotFoundError, match='dispersion study not found'):
+        s.run_paired_detection(base_output=tmp_path / 'base', extension_output=tmp_path / 'extension',
+                               dispersion_output=tmp_path / 'missing', output=output)
+    assert not output.exists()
+
+
 def test_python_v2_parallel_resume_and_complete_cache(tmp_path):
     # Two tiny actual episodes check spawned imports, source-bound config,
     # deterministic banks and cache replay without a costly experiment.

@@ -2359,10 +2359,14 @@ def _sensitivity_source_compatibility(source: Path, records: dict[str, str]) -> 
         raise ValueError("numerical methods/C source compatibility mismatch")
     additions = {
         "config.py": {"SENSITIVITY_EXTENSION_VERSION", "get_sensitivity_extension_config",
-            "DISPERSION_SENSITIVITY_VERSION", "get_dispersion_sensitivity_config"},
+            "DISPERSION_SENSITIVITY_VERSION", "get_dispersion_sensitivity_config",
+            "PAIRED_DETECTION_VERSION", "ORACLE_OCFR", "PAIRED_DETECTION_METHODS"},
         "simulation.py": {"_sensitivity_source_compatibility", "_sensitivity_check_grid",
             "_sensitivity_base_inputs", "run_sensitivity_extension", "load_sensitivity_extension",
-            "run_dispersion_sensitivity", "load_dispersion_sensitivity", "_dispersion_write_results"}}
+            "run_dispersion_sensitivity", "load_dispersion_sensitivity", "_dispersion_write_results",
+            "_paired_score_batch", "_paired_source", "_paired_check_grid", "_paired_replay_identity",
+            "_paired_native_replay", "_paired_alarm_fields", "_paired_oracle_record", "_paired_trace_rows",
+            "_paired_dispersion_archive", "_paired_export", "run_paired_detection"}}
     checks = {}
     for name in ("config.py", "simulation.py"):
         def nodes(path, extension):
@@ -2680,6 +2684,375 @@ def load_dispersion_sensitivity(output: Path, **kwargs):
     return load_sensitivity_extension(output, **kwargs, _dispersion=True)
 
 
+def _paired_score_batch(task):
+    """Replay raw, gated OCFR scans without generating multiplier paths."""
+    config, scenario, episodes = task
+    looks = _planned_looks(scenario, config)
+    results = []
+    for replicate, hashes in episodes:
+        cases, deaths, delay, streams = _compact_generate_components(scenario, config, replicate)
+        if any(streams["hashes"].get(key) != value for key, value in hashes.items()):
+            raise ValueError(f"paired replay stream mismatch: {scenario.name}/{replicate}")
+        trace = []
+        for prefix in looks:
+            scan = score_scan(cases[:prefix], deaths[:prefix], delay,
+                use_lindeberg_gate=config.methods.use_lindeberg_gate, backend=config.methods.backend)
+            available = bool(scan.candidates.size and scan.null_fit.success and np.isfinite(scan.statistic))
+            trace.append((prefix - 1, float(scan.statistic) if available else -float("inf"),
+                          scan.tau_hat if available else None, int(scan.direction) if available else 0))
+        results.append((scenario.name, replicate, trace))
+    return results
+
+
+def _paired_source(folder, stage, config, methods, threshold_hash=None):
+    manifest_path = folder / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+    selected = (config.scenarios if stage.endswith("sensitivity") or stage == "sensitivity-extension"
+                else _compact_stage_scenarios(config, stage))
+    counts = {s.name: config.replications_for(s.split) for s in selected}
+    path = folder / "replicate_results.csv"
+    file_hash = _file_hash(path)
+    if (manifest.get("status") != "complete" or manifest.get("stage") != stage
+            or manifest.get("mode") != config.mode or manifest.get("scientific_config") != config.scientific_payload()
+            or manifest.get("replications_by_scenario") != counts or manifest.get("methods") != list(methods)
+            or manifest.get("artifacts", {}).get(path.name) != file_hash):
+        raise ValueError(f"paired source contract or hash mismatch: {path}")
+    if stage != "calibration" and manifest.get("threshold_artifact", {}).get("sha256") != threshold_hash:
+        raise ValueError(f"paired source used different fixed cutoffs: {path}")
+    record = {"manifest_sha256": _file_hash(manifest_path), "replicate_results_sha256": file_hash,
+              "scientific_digest": manifest["scientific_digest"]}
+    return path, counts, record
+
+
+def _paired_check_grid(frame, counts, methods):
+    expected = {(scenario, r, method) for scenario, n in counts.items()
+                for r in range(n) for method in methods}
+    actual = set(frame[["scenario", "replicate", "method"]].itertuples(index=False, name=None))
+    if len(frame) != len(expected) or actual != expected or not frame["status"].eq("success").all():
+        raise ValueError("paired episode grid has missing, duplicate or failed rows")
+
+
+def _paired_replay_identity(source_hash, config, n):
+    from config import PAIRED_DETECTION_VERSION
+    import inspect
+    _, records = _code_hash()
+    return {"source_sha256": source_hash, "backend": "c", "n": n,
+            "protocol": PAIRED_DETECTION_VERSION, "scientific_config": config.scientific_payload(),
+            "worker_sha256": _sha256_bytes(inspect.getsource(_paired_score_batch).encode("utf-8")),
+            "dgp_sha256": _sha256_bytes(inspect.getsource(_compact_generate_components).encode("utf-8")),
+            "numerical_files": {k: v for k, v in records.items() if k == "methods.py" or k.startswith("csrc/")}}
+
+
+def _paired_native_replay(path, source_hash, config, hashes, jobs):
+    """Cache only raw scans after checking every regenerated case/death stream."""
+    from methods import fast_available
+    if not fast_available():
+        raise RuntimeError("a native C build is required for raw OCFR replay")
+    identity = _paired_replay_identity(source_hash, config, len(hashes))
+    if path.is_file():
+        with path.open(encoding="utf-8") as source:
+            if json.loads(next(source)) == identity:
+                results = {(scenario, r): trace for scenario, r, trace in map(json.loads, source)}
+                if set(results) == set(hashes):
+                    return results
+    work = []
+    for scenario in config.scenarios:
+        episodes = sorted((r, values) for (name, r), values in hashes.items() if name == scenario.name)
+        work.extend((config, scenario, episodes[i:i+40]) for i in range(0, len(episodes), 40))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    results = {}
+    from contextlib import ExitStack
+    with ExitStack() as stack:
+        if jobs == 1:
+            batches = map(_paired_score_batch, work)
+        else:
+            pool = stack.enter_context(ProcessPoolExecutor(max_workers=jobs))
+            batches = pool.map(_paired_score_batch, work)
+        destination = stack.enter_context(temporary.open("w", encoding="utf-8"))
+        destination.write(_diagnostic_json(identity) + "\n")
+        for batch in batches:
+            for scenario, r, trace in batch:
+                destination.write(_diagnostic_json([scenario, r, trace]) + "\n")
+                results[scenario, r] = trace
+    if set(results) != set(hashes):
+        raise RuntimeError("paired scan replay produced an incomplete episode grid")
+    os.replace(temporary, path)
+    return results
+
+
+def _paired_alarm_fields(record, day, selected_day, direction, window):
+    alarm = day is not None
+    alternative = record["split"] == "alternative"
+    true_change = record["true_change"]
+    postchange = alternative and alarm and day >= true_change
+    timely = postchange and day <= true_change + window
+    return {"alarm_day": day, "tau_hat_at_alarm": selected_day,
+            "direction_at_alarm": direction, "alarm": alarm, "no_alarm": not alarm,
+            "premature_alarm": alternative and alarm and not postchange,
+            "postchange_detection": postchange, "no_postchange_detection": alternative and not postchange,
+            "detected_within_28": timely,
+            "localization_abs_error_conditional": abs(selected_day - true_change)
+                if timely and selected_day is not None else None,
+            "restricted_delay": day - true_change if postchange else record["horizon"] - true_change}
+
+
+def _paired_oracle_record(record, trace, threshold, window):
+    from config import ORACLE_OCFR
+    first = next((look for look in trace if np.isfinite(look[1])
+                  and look[1] > threshold["critical_value"]), (None, None, None, None))
+    best = max(trace, key=lambda look: look[1])
+    oracle = dict(record, method=ORACLE_OCFR, score_definition="raw planned-look statistic",
+                  episode_statistic=best[1], raw_episode_max=best[1], max_day=best[0],
+                  tau_hat_at_max=best[2], direction_at_max=best[3],
+                  critical_value=threshold["critical_value"], threshold_version=threshold["threshold_version"],
+                  all_looks_unavailable=not np.isfinite(best[1]),
+                  unavailable_looks=sum(not np.isfinite(look[1]) for look in trace))
+    oracle.update(_paired_alarm_fields(record, first[0], first[2], first[3], window))
+    return oracle
+
+
+def _paired_trace_rows(path, config, scenarios, fixed_cutoffs):
+    """Preserve original crossings, and derive oracle crossings from the same scans."""
+    from config import ORACLE_OCFR
+    rows = []
+    window = config.dgp.timely_window
+    dropped = {"runtime_seconds", "trace_json", "stream_manifest_json"}
+    for batch in pd.read_csv(path, chunksize=1000, float_precision="round_trip"):
+        for record in batch.to_dict("records"):
+            scenario = scenarios[record["scenario"]]
+            method = record["method"]
+            key = (scenario.null_family, method)
+            cutoff = fixed_cutoffs.get(key, {}).get("critical_value", 0.)
+            trace = json.loads(record["trace_json"])
+            streams = json.loads(record["stream_manifest_json"])
+            seeds = _component_seeds(scenario, config, int(record["replicate"]))
+            looks = _planned_looks(scenario, config)
+            if (streams["seeds"] != seeds or tuple(x["day"] + 1 for x in trace) != looks
+                    or cutoff != record["critical_value"]):
+                raise ValueError(f"paired input seed, look or cutoff mismatch: {scenario.name}/{method}")
+            first = next((look for look in trace if look["status"] == "available"
+                          and np.isfinite(look["statistic"]) and look["statistic"] > cutoff), None)
+            saved_day = record["alarm_day"] if pd.notna(record["alarm_day"]) else None
+            saved_tau = record["tau_hat_at_alarm"] if pd.notna(record["tau_hat_at_alarm"]) else None
+            if (saved_day != (first["day"] if first else None)
+                    or saved_tau != (first["tau_hat"] if first else None)
+                    or record["alarm"] != (first is not None)):
+                raise ValueError(f"paired input crossing mismatch: {scenario.name}/{method}")
+            raw = [(look["day"], look["raw_statistic"], look["tau_hat"], look["direction"])
+                   for look in trace]
+            normalized = {key: value for key, value in record.items() if key not in dropped}
+            normalized.update(case_hash=streams["hashes"]["cases"],
+                              death_hash=streams["hashes"]["deaths"],
+                              raw_episode_max=max(look[1] for look in raw),
+                              rng_split=scenario.split,
+                              direction_at_alarm=int(first["direction"]) if first is not None else None)
+            rows.append(normalized)
+            if method == "OCFR":
+                rows.append(_paired_oracle_record(normalized, raw,
+                    fixed_cutoffs[scenario.null_family, ORACLE_OCFR], window))
+    return pd.DataFrame(rows)
+
+
+def _paired_dispersion_archive(path, config, counts, fixed_cutoffs, replay_path, jobs, threshold_hash):
+    """Read the original scalar Figure 6D archive and replay OCFR's raw scans."""
+    from config import ORACLE_OCFR, COMPACT_V2_METHODS
+    manifest_path = path.parent / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+    if (manifest["identity"]["threshold_sha256"] != threshold_hash
+            or manifest["master_seed"] != config.master_seed
+            or manifest["replications_per_cell"] != config.replications
+            or manifest["scenarios"] != [asdict(s) for s in config.scenarios]
+            or manifest["methods"] != asdict(config.methods) or manifest["dgp"] != asdict(config.dgp)):
+        raise ValueError("original dispersion archive disagrees with the frozen design")
+    original = pd.read_csv(path, float_precision="round_trip").assign(status="success")
+    _paired_check_grid(original, counts, COMPACT_V2_METHODS)
+    source_hash = _file_hash(path)
+    hashes = {(r.scenario, r.replicate): {"cases": r.case_hash, "deaths": r.death_hash}
+              for r in original[original.method.eq("OCFR")].itertuples()}
+    from dataclasses import replace
+    trace_by_episode = _paired_native_replay(replay_path, source_hash,
+        replace(config, methods=replace(config.methods, backend="c")), hashes, jobs)
+    scenarios = {s.name: s for s in config.scenarios}
+    rows = []
+    for src in original.to_dict("records"):
+        key = (src["scenario"], src["replicate"])
+        s = scenarios[key[0]]
+        seeds = _component_seeds(s, config, key[1])
+        if (src["case_hash"] != hashes[key]["cases"] or src["death_hash"] != hashes[key]["deaths"]
+                or src["phi"] != s.phi or src["risk_ratio"] != s.risk_ratio
+                or src["null"] != (s.risk_ratio == 1.)):
+            raise ValueError(f"dispersion archive stream or design mismatch: {key}")
+        cutoff = fixed_cutoffs.get((s.null_family, src["method"]), {})
+        day = int(src["alarm_day"] - 1) if src["alarm"] else None # original archive is one-based
+        trace = trace_by_episode[key]
+        at_alarm = next((look for look in trace if look[0] == day), (None, None, None, None))
+        best = max(trace, key=lambda look: look[1])
+        practical = src["method"] == "OCFR"
+        if practical and (sum(not np.isfinite(look[1]) for look in trace) != src["unavailable_looks"]
+                          or (day is not None and not np.isfinite(at_alarm[1]))):
+            raise ValueError(f"dispersion replay eligibility mismatch: {key}")
+        row = {"scenario": s.name, "family": s.family, "null_family": s.null_family,
+               "split": "holdout" if src["null"] else "alternative", "rng_split": s.split,
+               "purpose": s.purpose, "misspecification": s.misspecification,
+               "horizon": s.horizon, "profile": s.profile, "case_level": s.case_level,
+               "pi_left": s.pi_left, "pi_right": s.pi_right, "risk_ratio": s.risk_ratio, "phi": s.phi,
+               "true_change": s.true_change, "true_change_day": s.true_change + 1,
+               "true_delay_mean_days": s.true_delay_mean_days,
+               "assumed_delay_mean_days": s.assumed_delay_mean_days, "replicate": key[1],
+               "method": src["method"], "status": "success", "case_hash": src["case_hash"],
+               "death_hash": src["death_hash"], "case_seed": seeds["case"], "death_seed": seeds["death"],
+               "multiplier_seed": seeds["multiplier"], "raw_episode_max": best[1] if practical else None,
+               "critical_value": cutoff.get("critical_value", 0.),
+               "threshold_version": cutoff.get("threshold_version", config.boundary_policy),
+               "unavailable_looks": src["unavailable_looks"],
+               "all_looks_unavailable": src["unavailable_looks"] == len(trace)}
+        row.update(_paired_alarm_fields(row, day, at_alarm[2] if practical else None,
+                                        at_alarm[3] if practical else None, config.dgp.timely_window))
+        if src["useful"] != row["postchange_detection"] or src["premature"] != row["premature_alarm"]:
+            raise ValueError(f"dispersion archive first crossing disagrees with outcome flags: {key}")
+        rows.append(row)
+        if practical:
+            rows.append(_paired_oracle_record(row, trace, fixed_cutoffs["wave", ORACLE_OCFR], config.dgp.timely_window))
+    return pd.DataFrame(rows), {"manifest_sha256": _file_hash(manifest_path),
+                               "replicate_results_sha256": source_hash,
+                               "scientific_digest": manifest["identity"]["scientific_digest"],
+                               "archive_day_index": "one-based"}
+
+
+def _paired_export(frame, output, stage, config, counts, source, thresholds_hash, digest,
+                   *, scan_replay_backend=None):
+    from config import PAIRED_DETECTION_VERSION
+    folder = output / stage
+    folder.mkdir(parents=True, exist_ok=True)
+    frame = frame.sort_values(["scenario", "replicate", "method"], ignore_index=True)
+    path = folder / "replicate_results.csv"
+    _atomic_csv(frame, path)
+    artifacts = {path.name: _file_hash(path)}
+    if stage == "calibration":
+        artifacts["thresholds.csv"] = thresholds_hash
+    _atomic_json({"schema_version": SCHEMA_VERSION, "protocol": PAIRED_DETECTION_VERSION,
+        "scientific_digest": digest, "stage": stage, "status": "complete", "mode": config.mode,
+        "source": source, "methods": sorted(frame["method"].unique().tolist()),
+        "replications_by_scenario": counts, "scientific_config": config.scientific_payload(),
+        "threshold_artifact": {"sha256": thresholds_hash}, "crossing": "strict >",
+        "scan_replay_backend": scan_replay_backend,
+        "original_alarm_dates_preserved": stage != "calibration",
+        "day_index": "zero-based; true_change_day is one-based", "artifacts": artifacts},
+        folder / "manifest.json")
+
+
+def run_paired_detection(*, base_output: Path, extension_output: Path, dispersion_output: Path,
+                         output: Path, jobs: int = 1):
+    """Reuse a completed reference study, fit its oracle cutoffs, and pair all rules."""
+    from config import (ORACLE_OCFR, PAIRED_DETECTION_METHODS, PAIRED_DETECTION_VERSION,
+                        get_sensitivity_extension_config, get_dispersion_sensitivity_config)
+    from dataclasses import replace
+    if jobs != -1 and jobs < 1:
+        raise ValueError("jobs must be positive or -1")
+    jobs = (os.cpu_count() or 1) if jobs == -1 else jobs
+    base, extension, dispersion, output = map(lambda p: Path(p).resolve(),
+        (base_output, extension_output, dispersion_output, output))
+    if output == base or output == extension or output == dispersion or dispersion.is_relative_to(output):
+        raise ValueError("paired output must be separate from original study artifacts")
+    if not dispersion.is_file() and not dispersion.is_dir():
+        raise FileNotFoundError(f"dispersion study not found: {dispersion}")
+    dispersion_folder = dispersion / "dispersion-sensitivity" if dispersion.is_dir() else dispersion.parent
+    dispersion_results = dispersion_folder / "replicate_results.csv" if dispersion.is_dir() else dispersion
+    for required in (dispersion_folder / "manifest.json", dispersion_results):
+        if not required.is_file():
+            raise FileNotFoundError(f"dispersion study file not found: {required}")
+    cal_folder = base / "calibration"
+    evaluation_manifest = json.loads((base / "evaluation" / "manifest.json").read_text(encoding="utf-8"))
+    config = _estimation_source_config(evaluation_manifest, evaluation_manifest["mode"])
+    if (config.mode != "full" or config.methods.backend not in {"c", "python"}
+            or config.scientific_payload() != get_compact_release_study_config(
+                backend=config.methods.backend).scientific_payload()):
+        raise ValueError("paired detection requires a completed compact-v2 release design")
+    _, code_hash, records = _scientific_digest(config)
+    numerical = {name: value for name, value in records.items() if name == "methods.py" or name.startswith("csrc/")}
+    if any(evaluation_manifest.get("code_files", {}).get(k) != v for k, v in numerical.items()):
+        raise ValueError("reference numerical source does not match paired replay")
+    thresholds_path = cal_folder / "thresholds.csv"
+    original_hash = _file_hash(thresholds_path)
+    calibration_path, counts, source = _paired_source(cal_folder, "calibration",
+        config, config.stage_methods("calibration"))
+    _compact_read_thresholds(thresholds_path, source["scientific_digest"],
+                             {s.null_family for s in config.scenarios}, config)
+    frozen = pd.read_csv(thresholds_path, float_precision="round_trip")
+    training = pd.read_csv(calibration_path, float_precision="round_trip", usecols=[
+        "scenario", "family", "null_family", "method", "replicate", "split", "status",
+        "case_seed", "death_seed", "episode_statistic", "stream_manifest_json", "unavailable_looks"])
+    _paired_check_grid(training, counts, config.stage_methods("calibration"))
+    recomputed = _compact_calibrate(training, config.methods.alpha, source["scientific_digest"], 10_000)
+    keys = ["null_family", "method"]
+    compare = frozen.merge(recomputed, on=keys, suffixes=("_frozen", "_ranked"), validate="one_to_one")
+    if (len(compare) != 6 or not compare["order_rank_frozen"].eq(9501).all()
+            or not compare["critical_value_frozen"].eq(compare["critical_value_ranked"]).all()):
+        raise ValueError("frozen benchmark cutoffs do not match the shared training-bank maxima")
+    scenario_map = {s.name: s for s in config.scenarios}
+    hashes = {}
+    for row in training.itertuples():
+        streams = json.loads(row.stream_manifest_json)
+        key = (row.scenario, row.replicate)
+        expected = _component_seeds(scenario_map[row.scenario], config, row.replicate)
+        data_hashes = {k: v for k, v in streams["hashes"].items() if k != "multipliers"}
+        if (streams["seeds"] != expected or row.case_seed != expected["case"]
+                or row.death_seed != expected["death"] or row.split != "calibration"
+                or (key in hashes and hashes[key] != data_hashes)):
+            raise ValueError(f"paired training seed or input mismatch: {key}")
+        hashes[key] = data_hashes
+    print(f"Replaying {len(hashes):,} reference training episodes", flush=True)
+    native = replace(config, methods=replace(config.methods, backend="c"))
+    raw_traces = _paired_native_replay(output / "cache" / "calibration.jsonl",
+        source["replicate_results_sha256"], native, hashes, jobs)
+    training["case_hash"] = [hashes[r.scenario, r.replicate]["cases"] for r in training.itertuples()]
+    training["death_hash"] = [hashes[r.scenario, r.replicate]["deaths"] for r in training.itertuples()]
+    training = training.drop(columns="stream_manifest_json")
+    oracle = training[training["method"].eq("NB-GLR")].copy()
+    oracle["method"] = ORACLE_OCFR
+    oracle["episode_statistic"] = [max(x[1] for x in raw_traces[r.scenario, r.replicate]) for r in oracle.itertuples()]
+    oracle["unavailable_looks"] = [sum(not np.isfinite(x[1]) for x in raw_traces[r.scenario, r.replicate])
+                                  for r in oracle.itertuples()]
+    source.update(thresholds_sha256=original_hash, numerical_sources=numerical, code_hash=code_hash)
+    digest = _sha256_bytes(_canonical_json({"protocol": PAIRED_DETECTION_VERSION,
+        "reference": source, "scientific": config.scientific_payload()}).encode("ascii"))[:20]
+    thresholds = pd.concat([frozen, _compact_calibrate(oracle, config.methods.alpha, digest, 10_000)], ignore_index=True)
+    cutoffs = {(r["null_family"], r["method"]): r for r in thresholds.to_dict("records")}
+    (output / "calibration").mkdir(parents=True, exist_ok=True)
+    new_thresholds_path = output / "calibration" / "thresholds.csv"
+    _atomic_csv(thresholds, new_thresholds_path)
+    thresholds_hash = _file_hash(new_thresholds_path)
+    calibrated = pd.concat([training, oracle], ignore_index=True)
+    calibrated["raw_episode_max"] = calibrated["episode_statistic"]
+    _paired_export(calibrated, output, "calibration", config, counts, source, thresholds_hash,
+                   digest, scan_replay_backend="c")
+    del raw_traces
+    stage_inputs = [(base / stage, stage, config) for stage in ("audit", "evaluation")]
+    stage_inputs.append((extension / "sensitivity-extension", "sensitivity-extension",
+                         get_sensitivity_extension_config(config)))
+    dispersion_config = get_dispersion_sensitivity_config(config)
+    if dispersion.is_dir():
+        stage_inputs.append((dispersion_folder, "dispersion-sensitivity", dispersion_config))
+    for folder, stage, study in stage_inputs:
+        print(f"Pairing original traces from {stage}", flush=True)
+        path, counts, source = _paired_source(folder, stage, study, config.stage_methods("evaluation"), original_hash)
+        frame = _paired_trace_rows(path, study, {s.name: s for s in study.scenarios}, cutoffs)
+        _paired_check_grid(frame, counts, PAIRED_DETECTION_METHODS)
+        if frame.groupby(["scenario", "replicate"])[["case_hash", "death_hash"]].nunique().gt(1).any().any():
+            raise ValueError(f"paired methods used different episodes: {stage}")
+        _paired_export(frame, output, stage, study, counts, source, thresholds_hash, digest)
+    if dispersion.is_file():
+        print("Pairing original dispersion archive", flush=True)
+        counts = {s.name: dispersion_config.replications_for(s.split) for s in dispersion_config.scenarios}
+        frame, source = _paired_dispersion_archive(dispersion, dispersion_config, counts, cutoffs,
+            output / "cache" / "dispersion.jsonl", jobs, original_hash)
+        _paired_check_grid(frame, counts, PAIRED_DETECTION_METHODS)
+        _paired_export(frame, output, "dispersion-sensitivity", dispersion_config, counts,
+                       source, thresholds_hash, digest, scan_replay_backend="c")
+    return thresholds
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("demo", "full"), default="demo")
@@ -2689,7 +3062,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--jobs", type=int, default=1, help="workers; -1 uses all CPUs")
     parser.add_argument("--backend", choices=("c", "python", "auto"), default=None,
                         help="default is strict C; python/auto are diagnostic overrides")
-    parser.add_argument("--stage", choices=("calibration", "audit", "evaluation", "estimation", "estimation-reference", "estimation-stabilized", "estimation-validation", "estimation-poisson", "estimation-ls", "sensitivity-extension", "dispersion-sensitivity"), default="evaluation",
+    parser.add_argument("--stage", choices=("calibration", "audit", "evaluation", "estimation", "estimation-reference", "estimation-stabilized", "estimation-validation", "estimation-poisson", "estimation-ls", "sensitivity-extension", "dispersion-sensitivity", "paired-detection"), default="evaluation",
                         help="compact-v1 auxiliary or evaluation stage; no implicit calibration")
     parser.add_argument("--thresholds", type=Path, default=None,
                         help="frozen compact calibration thresholds.csv")
@@ -2701,6 +3074,8 @@ def _parser() -> argparse.ArgumentParser:
                         help="Frozen point-comparison reporting bank; source overrides require a single bank")
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--base-study", type=Path, default=None, help="completed frozen parent study for sensitivity extension")
+    parser.add_argument("--extension-study", type=Path, default=None, help="completed sensitivity extension for paired detection")
+    parser.add_argument("--dispersion-study", type=Path, default=None, help="completed dispersion study or original episodes.csv for paired detection")
     parser.add_argument("--base-source", "--base-code", type=Path, default=None, help="frozen parent core source snapshot (auto-resolved in full_sources layout)")
     parser.add_argument("--scenarios", nargs="*", default=None)
     parser.add_argument("--reset", nargs="?", const="selected", default="none",
@@ -2710,6 +3085,15 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.stage == "paired-detection":
+        if any(p is None for p in (args.base_study, args.extension_study, args.dispersion_study, args.output)):
+            raise SystemExit("paired detection requires --base-study, --extension-study, --dispersion-study and --output")
+        if args.backend is not None or args.thresholds is not None or args.scenarios is not None or args.reset != "none":
+            raise SystemExit("paired detection uses the complete frozen reference sources and native raw replay")
+        thresholds = run_paired_detection(base_output=args.base_study, extension_output=args.extension_study,
+            dispersion_output=args.dispersion_study, output=args.output, jobs=args.jobs)
+        print(thresholds.to_string(index=False))
+        return 0
     if args.stage in {"sensitivity-extension", "dispersion-sensitivity"}:
         if args.base_study is None or args.output is None:
             raise SystemExit("sensitivity extension requires --base-study and --output")
