@@ -13,7 +13,8 @@ import os
 import shutil
 import time
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, as_completed, wait
-from dataclasses import asdict
+from contextlib import ExitStack
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Iterable, Literal
 
@@ -37,6 +38,7 @@ from methods import (gamma_delay_pmf, make_correlated_epidemic_cases, make_sampl
 SCHEMA_VERSION = 3
 METHODS = ("OCFR", "OCFR-alpha-matched", "Report-day score",
            "NB-GLR", "Page-CUSUM", "FOCuS")
+BOUNDARY_ABLATION_METHODS = ("OCFR", "OCFR Bonferroni")
 ResetScope = Literal["none", "selected", "derived", "all"]
 
 def _canonical_json(value: object) -> str:
@@ -349,7 +351,8 @@ def _valid_hex(value: object) -> bool:
     return isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
 
 def _load_cache(path: Path, *, digest: str, scenario: SimulationScenario,
-                replicate: int, config: ExperimentConfig) -> dict[str, object] | None:
+                replicate: int, config: ExperimentConfig,
+                expected_methods: tuple[str, ...] | None = None) -> dict[str, object] | None:
     """Return only complete successful cache payloads; failures are retried."""
     if not path.is_file():
         return None
@@ -358,8 +361,9 @@ def _load_cache(path: Path, *, digest: str, scenario: SimulationScenario,
     except (OSError, json.JSONDecodeError):
         return None
     rows, streams = payload.get("rows"), payload.get("stream_manifest")
-    expected_methods = (_compact_method_names(scenario, config) if config.protocol in {"compact-v1", "compact-v2"}
-                        else METHODS)
+    if expected_methods is None:
+        expected_methods = (_compact_method_names(scenario, config)
+                            if config.protocol in {"compact-v1", "compact-v2"} else METHODS)
     if (payload.get("schema_version") != SCHEMA_VERSION
             or payload.get("scientific_digest") != digest
             or payload.get("scenario_digest") != _scenario_digest(scenario)
@@ -2797,6 +2801,118 @@ def _paired_alarm_fields(record, day, selected_day, direction, window):
             "restricted_delay": day - true_change if postchange else record["horizon"] - true_change}
 
 
+def _boundary_ablation_episode(task):
+    """Use the same score and Gaussian maxima for both appendix boundaries."""
+    scenario, replicate, config, digest, cache = task
+    identity = dict(digest=digest, scenario=scenario, replicate=replicate, config=config,
+                    expected_methods=BOUNDARY_ABLATION_METHODS)
+    saved = _load_cache(cache, **identity)
+    if saved is not None:
+        return saved
+
+    cases, deaths, delay, streams = _compact_generate_components(scenario, config, replicate)
+    from methods import exposure_components, MU_FLOOR
+    exposure, _ = exposure_components(cases, delay)
+    if np.any((exposure <= MU_FLOOR) & (deaths > 0)):
+        raise ValueError("positive simulated deaths with zero convolution exposure")
+    looks = _planned_looks(scenario, config)
+    draws, alpha = config.methods.n_multiplier, config.methods.alpha
+    rng = make_sampler(streams["seeds"]["multiplier"], backend="python")
+    bank = gaussian_multiplier_bank(rng, (draws, scenario.horizon),
+                                    normal_mode="pcg32-numpy-box-muller-v1")
+    streams["backends"]["multiplier"] = rng.backend
+    streams["hashes"]["multipliers"] = _array_hash(bank)
+    spending = GaussianSpendingBoundary(draws, len(looks), alpha)
+    trace = []
+    for prefix in looks:
+        scan = score_scan(cases[:prefix], deaths[:prefix], delay, backend="python")
+        available = bool(scan.null_fit.success and scan.candidates.size and np.isfinite(scan.statistic))
+        maxima = (multiplier_statistics_from_draws(bank[:, :prefix], scan.influence, backend="python")
+                  if available else None)
+        # An unavailable look still advances the cumulative schedule. The
+        # Bonferroni allocation always uses the total number of planned looks.
+        cumulative = spending.advance(maxima, available=available).boundary
+        bonferroni = (monte_carlo_critical_value(maxima, alpha / len(looks))
+                      if available else float("inf"))
+        trace.append((prefix - 1, float(scan.statistic) if available else -float("inf"),
+                      scan.tau_hat, cumulative, bonferroni))
+
+    rows = []
+    for method, boundary_index in zip(BOUNDARY_ABLATION_METHODS, (3, 4)):
+        first = next((look for look in trace if look[1] > look[boundary_index]), None)
+        day, tau = (first[0], first[2]) if first is not None else (None, None)
+        useful = scenario.split == "alternative" and day is not None and day >= scenario.true_change
+        rows.append({"stage": "audit" if scenario.split == "size_audit" else "alternative",
+                     "scenario": scenario.name, "replicate": replicate, "method": method,
+                     "risk_ratio": scenario.risk_ratio, "status": "success",
+                     "alarm_day": None if day is None else day + 1,
+                     "selected_day": None if tau is None else tau + 1,
+                     "true_change_day": scenario.true_change + 1, "alarm": day is not None,
+                     "useful": useful, "timely35": useful and day <= scenario.true_change + 35})
+    payload = {"schema_version": SCHEMA_VERSION, "scientific_digest": digest,
+               "scenario_digest": _scenario_digest(scenario), "scenario": scenario.name,
+               "replicate": replicate, "rows": rows, "stream_manifest": streams, "trace": trace}
+    payload["payload_hash"] = _payload_hash(payload)
+    _atomic_json(payload, cache)
+    return payload
+
+
+def run_boundary_ablation(*, output: Path, mode: str = "full", jobs: int = 1) -> pd.DataFrame:
+    """Reproduce the appendix table and paired contrasts with independent banks."""
+    from config import get_boundary_ablation_configs
+    if jobs != -1 and jobs < 1:
+        raise ValueError("jobs must be positive or -1")
+    jobs = (os.cpu_count() or 1) if jobs == -1 else jobs
+    stage = Path(output) / "boundary-ablation"
+    manifest_path = stage / "manifest.json"
+    plans = get_boundary_ablation_configs(mode)
+    sources = [_scientific_digest(config)[0] for config in plans]
+    tasks = [(scenario, rep, config, digest, _cache_path(stage / "cache", digest, scenario.name, rep))
+             for config, digest in zip(plans, sources) for scenario in config.scenarios
+             for rep in range(config.replications)]
+    counts = {scenario.name: config.replications for config in plans for scenario in config.scenarios}
+    manifest = {"status": "running", "stage": "boundary-ablation", "mode": mode,
+                "methods": list(BOUNDARY_ABLATION_METHODS), "replications_by_scenario": counts,
+                "scientific_configs": [config.scientific_payload() for config in plans],
+                "scientific_digests": sources, "code_files": _code_hash()[1], "crossing": "strict >",
+                "day_index": "one-based", "probability_denominator": "all assigned episodes",
+                "confidence_level": .95}
+    _atomic_json(manifest, manifest_path)
+    with ExitStack() as stack:
+        if jobs == 1:
+            episodes = map(_boundary_ablation_episode, tasks)
+        else:
+            pool = stack.enter_context(ProcessPoolExecutor(max_workers=jobs))
+            episodes = pool.map(_boundary_ablation_episode, tasks, chunksize=5)
+        frame = pd.DataFrame(row for episode in episodes for row in episode["rows"])
+    _paired_check_grid(frame, counts, BOUNDARY_ABLATION_METHODS)
+
+    summaries, contrasts = [], []
+    for (bank, scenario), group in frame.groupby(["stage", "scenario"], sort=False):
+        metrics = ("alarm",) if bank == "audit" else ("useful", "timely35")
+        for metric in metrics:
+            paired = group.pivot(index="replicate", columns="method", values=metric).astype(int)
+            difference = paired[BOUNDARY_ABLATION_METHODS[0]] - paired[BOUNDARY_ABLATION_METHODS[1]]
+            n = len(difference)
+            cell = dict(stage=bank, scenario=scenario, risk_ratio=group["risk_ratio"].iloc[0],
+                        metric=metric, n=n)
+            contrasts.append(dict(cell, difference=difference.mean(),
+                                  paired_mcse=difference.std(ddof=1) / np.sqrt(n)))
+            for method in BOUNDARY_ABLATION_METHODS:
+                k = int(paired[method].sum())
+                low, high = _exact_binomial_interval(k, n, confidence=.95)
+                summaries.append(dict(cell, method=method, successes=k, estimate=k / n,
+                                      ci_lower=low, ci_upper=high))
+    summary = pd.DataFrame(summaries)
+    tables = {"episode_results.csv": frame, "summary.csv": summary,
+              "paired_contrasts.csv": pd.DataFrame(contrasts)}
+    for name, table in tables.items():
+        _atomic_csv(table, stage / name)
+    _atomic_json(dict(manifest, status="complete",
+                      artifacts={name: _file_hash(stage / name) for name in tables}), manifest_path)
+    return summary
+
+
 def _paired_oracle_record(record, trace, threshold, window):
     from config import ORACLE_OCFR
     first = next((look for look in trace if np.isfinite(look[1])
@@ -3038,10 +3154,31 @@ def run_paired_detection(*, base_output: Path, extension_output: Path, dispersio
         print(f"Pairing original traces from {stage}", flush=True)
         path, counts, source = _paired_source(folder, stage, study, config.stage_methods("evaluation"), original_hash)
         frame = _paired_trace_rows(path, study, {s.name: s for s in study.scenarios}, cutoffs)
+        scan_backend = None
+        if stage == "dispersion-sensitivity":
+            # Figure 6D used Python for practical boundaries and a C replay
+            # for the oracle raw scans. Preserve the practical and benchmark
+            # decisions and verify counts before substituting the oracle path.
+            practical = frame.loc[frame.method.eq("OCFR")].copy()
+            hashes = {(r.scenario, r.replicate): {"cases": r.case_hash, "deaths": r.death_hash}
+                      for r in practical.itertuples()}
+            native_study = replace(study, methods=replace(study.methods, backend="c"))
+            native_traces = _paired_native_replay(output / "cache" / "dispersion.jsonl",
+                source["replicate_results_sha256"], native_study, hashes, jobs)
+            practical["raw_episode_max"] = [max(look[1] for look in native_traces[r.scenario, r.replicate])
+                                              for r in practical.itertuples()]
+            oracle = [_paired_oracle_record(row, native_traces[row["scenario"], row["replicate"]],
+                          cutoffs["wave", ORACLE_OCFR], study.dgp.timely_window)
+                      for row in practical.to_dict("records")]
+            frame = pd.concat([frame.loc[~frame.method.isin(("OCFR", ORACLE_OCFR))],
+                               practical, pd.DataFrame(oracle)],
+                              ignore_index=True)
+            scan_backend = "c"
         _paired_check_grid(frame, counts, PAIRED_DETECTION_METHODS)
         if frame.groupby(["scenario", "replicate"])[["case_hash", "death_hash"]].nunique().gt(1).any().any():
             raise ValueError(f"paired methods used different episodes: {stage}")
-        _paired_export(frame, output, stage, study, counts, source, thresholds_hash, digest)
+        _paired_export(frame, output, stage, study, counts, source, thresholds_hash, digest,
+                       scan_replay_backend=scan_backend)
     if dispersion.is_file():
         print("Pairing original dispersion archive", flush=True)
         counts = {s.name: dispersion_config.replications_for(s.split) for s in dispersion_config.scenarios}
@@ -3053,6 +3190,106 @@ def run_paired_detection(*, base_output: Path, extension_output: Path, dispersio
     return thresholds
 
 
+def run_paper_simulations(*, output: Path, jobs: int = 1) -> None:
+    """Generate the paper's simulation banks, figures, and appendix table."""
+    import analysis
+    from methods import build_native, fast_available
+
+    if jobs != -1 and jobs < 1:
+        raise ValueError("jobs must be positive or -1")
+    # Practical boundaries and comparator training used Python. Oracle cutoff
+    # training and the dispersion oracle raw replay used the C99 kernels.
+    config = get_compact_release_study_config(backend="python")
+    native = build_native()
+    if not fast_available():
+        raise RuntimeError("the paper workflow requires loadable C99 kernels for native oracle replays")
+    output = Path(output).resolve()
+    base, extension, dispersion, paired, figures = (
+        output / name for name in ("base", "sensitivity", "dispersion", "paired", "figures"))
+    checkpoint = output / "paper_simulation_manifest.json"
+    identity = {"scientific_sources": _code_hash()[1], "native_sha256": _file_hash(native),
+                "reference_config": config.scientific_payload()}
+    state = {"identity": identity, "completed_stages": {}, "status": "running"}
+    if checkpoint.is_file():
+        state = json.loads(checkpoint.read_text(encoding="utf-8"))
+        if state["identity"] != identity:
+            raise ValueError("paper checkpoint belongs to another source or build; select a new output directory")
+    state["status"] = "running"
+    _atomic_json(state, checkpoint)
+
+    def run(stage, command, directories):
+        # Downstream records bind input manifest hashes. Keeping those bytes on
+        # resume prevents a completed training bank from changing its identity.
+        completed = state["completed_stages"]
+        if stage in completed:
+            if any(_file_hash(output / name) != value for name, value in completed[stage].items()):
+                raise ValueError(f"paper checkpoint artifact changed in {stage}")
+            print(f"Verified {stage}", flush=True)
+            return
+        print(f"Running {stage}", flush=True)
+        command()
+        artifacts = {}
+        for directory in directories:
+            manifest = directory / "manifest.json"
+            if stage == "interval-calibration":
+                paths = (directory / "CUTOFFS.json", directory / "FROZEN.json")
+            else:
+                record = json.loads(manifest.read_text(encoding="utf-8"))
+                if record.get("status") != "complete":
+                    raise RuntimeError(f"incomplete paper stage: {stage}")
+                for name, digest in record["artifacts"].items():
+                    path = directory / name
+                    if _file_hash(path) != digest:
+                        raise RuntimeError(f"artifact mismatch in {stage}: {path}")
+                    artifacts[path.relative_to(output).as_posix()] = digest
+                paths = (manifest,)
+            artifacts.update({path.relative_to(output).as_posix(): _file_hash(path) for path in paths})
+        completed[stage] = artifacts
+        _atomic_json(state, checkpoint)
+
+    for stage in ("calibration", "audit", "evaluation"):
+        run(stage, lambda: run_compact_simulations(config, output=base, stage=stage, jobs=jobs,
+                                                    return_mode="slim"), (base / stage,))
+    run("sensitivity-extension", lambda: run_sensitivity_extension(base_output=base, output=extension,
+        jobs=jobs), (extension / "sensitivity-extension",))
+    run("dispersion-sensitivity", lambda: run_dispersion_sensitivity(base_output=base, output=dispersion,
+        jobs=jobs), (dispersion / "dispersion-sensitivity",))
+    paired_stages = ("calibration", "audit", "evaluation", "sensitivity-extension", "dispersion-sensitivity")
+    run("paired-detection", lambda: run_paired_detection(base_output=base, extension_output=extension,
+        dispersion_output=dispersion, output=paired, jobs=jobs), tuple(paired / stage for stage in paired_stages))
+    run("boundary-ablation", lambda: run_boundary_ablation(output=output, jobs=jobs),
+        (output / "boundary-ablation",))
+
+    options = dict(output=base, mode="full", jobs=jobs)
+    for stage, runner in (("estimation", run_compact_estimation),
+                          ("estimation-reference", run_compact_estimation_reference),
+                          ("estimation-stabilized", run_compact_estimation_stabilized)):
+        run(stage, lambda: runner(**options), (base / stage,))
+    # The cutoff file is frozen before independent validation starts. Its
+    # hash is supplied when constructing the validation intervals.
+    run("interval-calibration", lambda: analysis.run_interval_calibration(base),
+        (base / "interval-calibration",))
+    cutoff_sha = _file_hash(base / "interval-calibration" / "CUTOFFS.json")
+    run("estimation-validation", lambda: run_compact_estimation_validation(**options),
+        (base / "estimation-validation",))
+    run("interval-validation", lambda: analysis.run_interval_application(base, cutoff_sha),
+        (base / "interval-validation",))
+    for bank in ("original", "validation"):
+        stage = f"estimation-ls-{bank}"
+        run(stage, lambda: run_compact_estimation_ls(**options, bank=bank), (base / stage,))
+
+    analysis.plot_method_overview(figures)
+    analysis.analyze_paired_detection(paired, figures)
+    analysis.analyze_paper_estimation(base, figures)
+    state["status"] = "complete"
+    state["analysis_outputs"] = {
+        path.relative_to(output).as_posix(): _file_hash(path)
+        for path in (figures / "Fig1_method_overview.pdf",
+                     paired / "analysis" / "paired_detection_analysis_manifest.json",
+                     base / "analysis" / "paper_estimation_manifest.json")}
+    _atomic_json(state, checkpoint)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("demo", "full"), default="demo")
@@ -3062,7 +3299,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--jobs", type=int, default=1, help="workers; -1 uses all CPUs")
     parser.add_argument("--backend", choices=("c", "python", "auto"), default=None,
                         help="default is strict C; python/auto are diagnostic overrides")
-    parser.add_argument("--stage", choices=("calibration", "audit", "evaluation", "estimation", "estimation-reference", "estimation-stabilized", "estimation-validation", "estimation-poisson", "estimation-ls", "sensitivity-extension", "dispersion-sensitivity", "paired-detection"), default="evaluation",
+    parser.add_argument("--stage", choices=("calibration", "audit", "evaluation", "estimation", "estimation-reference", "estimation-stabilized", "estimation-validation", "estimation-poisson", "estimation-ls", "sensitivity-extension", "dispersion-sensitivity", "paired-detection", "boundary-ablation", "paper"), default="evaluation",
                         help="compact-v1 auxiliary or evaluation stage; no implicit calibration")
     parser.add_argument("--thresholds", type=Path, default=None,
                         help="frozen compact calibration thresholds.csv")
@@ -3085,6 +3322,21 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.stage in {"paper", "boundary-ablation"}:
+        overrides = (args.backend, args.thresholds, args.source_manifest, args.source_results,
+                     args.estimation_manifest, args.reference_manifest, args.base_study,
+                     args.extension_study, args.dispersion_study, args.base_source, args.scenarios)
+        if any(value is not None for value in overrides) or args.reset != "none":
+            raise SystemExit(f"{args.stage} uses the declared banks and backends and resumes its caches")
+        if args.stage == "paper":
+            if args.mode != "full":
+                raise SystemExit("paper replication requires --mode full")
+            run_paper_simulations(output=args.output or Path("outputs/paper"), jobs=args.jobs)
+        else:
+            summary = run_boundary_ablation(output=args.output or Path("outputs/paper"),
+                                            mode=args.mode, jobs=args.jobs)
+            print(summary.to_string(index=False))
+        return 0
     if args.stage == "paired-detection":
         if any(p is None for p in (args.base_study, args.extension_study, args.dispersion_study, args.output)):
             raise SystemExit("paired detection requires --base-study, --extension-study, --dispersion-study and --output")

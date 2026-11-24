@@ -1,5 +1,5 @@
 cff-version: 1.2.0
-title: "Online detection of changes in epidemic case-fatality risk with reporting delay"
+title: "Online detection of changes in epidemic case-fatality risk with delayed outcomes"
 message: "Please cite this software when using the OCFR implementation accompanying the manuscript."
 type: software
 authors:

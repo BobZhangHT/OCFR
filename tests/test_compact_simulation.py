@@ -14,6 +14,99 @@ import config
 import simulation as sim
 
 
+def test_paper_cli_resumes_complete_stages_before_freezing_validation(tmp_path, monkeypatch):
+    import analysis
+    import methods
+
+    completed = []
+    native = tmp_path / "test-native.dll"
+    native.write_bytes(b"native identity")
+    monkeypatch.setattr(methods, "build_native", lambda: native)
+    monkeypatch.setattr(methods, "fast_available", lambda: True)
+
+    def write_stage(output, stage):
+        completed.append(stage)
+        path = output / stage / "test.csv"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(stage.encode())
+        sim._atomic_json({"status": "complete", "artifacts": {path.name: sim._file_hash(path)}},
+                         path.parent / "manifest.json")
+
+    def interrupt(_config, *, output, stage, **_options):
+        if stage == "audit":
+            raise RuntimeError("interrupted")
+        write_stage(output, stage)
+
+    output = tmp_path / "paper"
+    args = ["--stage", "paper", "--mode", "full", "--output", str(output)]
+    monkeypatch.setattr(sim, "run_compact_simulations", interrupt)
+    with pytest.raises(RuntimeError, match="interrupted"):
+        sim.main(args)
+    assert completed == ["calibration"]
+    calibration = (output / "base" / "calibration" / "manifest.json").read_bytes()
+
+    monkeypatch.setattr(sim, "run_compact_simulations",
+                       lambda _config, output, stage, **_: write_stage(output, stage))
+    for stage in ("sensitivity_extension", "dispersion_sensitivity", "boundary_ablation",
+                  "compact_estimation", "compact_estimation_reference", "compact_estimation_stabilized"):
+        folder = stage.removeprefix("compact_").replace("_", "-")
+        monkeypatch.setattr(sim, f"run_{stage}",
+                           lambda output, folder=folder, **_: write_stage(output, folder))
+    monkeypatch.setattr(sim, "run_paired_detection",
+                       lambda output, **_: [write_stage(output, stage) for stage in
+                           ("calibration", "audit", "evaluation", "sensitivity-extension", "dispersion-sensitivity")])
+
+    def freeze(base):
+        completed.append("interval-calibration")
+        sim._atomic_json({"cutoff": 1}, base / "interval-calibration" / "CUTOFFS.json")
+        sim._atomic_json({"status": "frozen"}, base / "interval-calibration" / "FROZEN.json")
+
+    def validation(output, **_):
+        assert completed[-1] == "interval-calibration"
+        write_stage(output, "estimation-validation")
+
+    def apply(base, cutoff_sha):
+        assert completed[-1] == "estimation-validation"
+        assert cutoff_sha == sim._file_hash(base / "interval-calibration" / "CUTOFFS.json")
+        write_stage(base, "interval-validation")
+
+    monkeypatch.setattr(analysis, "run_interval_calibration", freeze)
+    monkeypatch.setattr(sim, "run_compact_estimation_validation", validation)
+    monkeypatch.setattr(analysis, "run_interval_application", apply)
+    monkeypatch.setattr(sim, "run_compact_estimation_ls",
+                       lambda output, bank, **_: write_stage(output, f"estimation-ls-{bank}"))
+    monkeypatch.setattr(analysis, "plot_method_overview",
+                       lambda figures: sim._atomic_json({}, figures / "Fig1_method_overview.pdf"))
+    monkeypatch.setattr(analysis, "analyze_paired_detection", lambda output, _figures:
+                       sim._atomic_json({}, output / "analysis" / "paired_detection_analysis_manifest.json"))
+    monkeypatch.setattr(analysis, "analyze_paper_estimation", lambda output, _figures:
+                       sim._atomic_json({}, output / "analysis" / "paper_estimation_manifest.json"))
+    assert sim.main(args) == 0
+    assert completed[1:3] == ["audit", "evaluation"]
+    assert (output / "base" / "calibration" / "manifest.json").read_bytes() == calibration
+    assert json.loads((output / "paper_simulation_manifest.json").read_bytes())["status"] == "complete"
+
+
+def test_boundary_ablation_uses_frozen_banks_and_exact_intervals(tmp_path):
+    full_audit, full_alternatives = config.get_boundary_ablation_configs("full")
+    assert (full_audit.master_seed, full_alternatives.master_seed) == (2026111612, 2026111613)
+    assert (full_audit.replications, full_alternatives.replications) == (2_000, 1_000)
+    assert full_audit.scenarios[0].name == "wave_audit"
+    assert full_audit.scenarios[0].split == "size_audit"
+    assert tuple(s.risk_ratio for s in full_alternatives.scenarios) == (2/3, 1.25, 1.5)
+
+    summary = sim.run_boundary_ablation(output=tmp_path, mode="demo")
+    audit = summary.loc[summary.metric.eq("alarm")]
+    assert audit.n.tolist() == [10, 10]
+    assert audit.successes.tolist() == [0, 0]
+    np.testing.assert_allclose(audit.ci_upper, 1 - .025 ** (1 / 10))
+    alternative = summary.loc[summary.scenario.eq("wave_rr125") & summary.metric.eq("useful")]
+    assert dict(zip(alternative.method, alternative.successes)) == {"OCFR": 8, "OCFR Bonferroni": 5}
+
+    # A completed rerun should consume only validated caches.
+    pd.testing.assert_frame_equal(summary, sim.run_boundary_ablation(output=tmp_path, mode="demo"))
+
+
 def test_compact_frozen_grid_and_mode_contract():
     demo = config.get_compact_experiment_config("demo", protocol="compact-v1")
     full = config.get_compact_experiment_config("full", protocol="compact-v1")

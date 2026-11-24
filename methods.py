@@ -2311,29 +2311,39 @@ def surveillance_benchmark_traces(
                                    ('Page-CUSUM', 'Page-CUSUM'))}
     lag = _delay_median(f)
     results: dict[str, list[BenchmarkResult]] = {"NB-GLR": [], "Page-CUSUM": []}
+    statistics, locations, directions = _surveillance_traces_from_baseline(
+        d, mean, residuals, phi, reference_end, prefixes, allowance, backend)
+    for j, prefix in enumerate(prefixes):
+        for column, key, label in ((0, 'NB-GLR', 'NB-surveillance-GLR'),
+                                    (1, 'Page-CUSUM', 'Page-CUSUM')):
+            calendar = int(locations[j, column])
+            results[key].append(BenchmarkResult(
+                label, prefix - 1, float(statistics[j, column]), calendar,
+                max(0, calendar - lag), int(directions[j, column])))
+    return results
+
+
+def _surveillance_traces_from_baseline(d, mean, residuals, phi, reference_end,
+                                       prefixes, allowance, backend):
+    """Evaluate both charts given the expected means and a frozen shape."""
     if backend == 'c':
-        statistics, locations, directions = _get_native_kernels().surveillance_benchmark_traces(
+        return _get_native_kernels().surveillance_benchmark_traces(
             d, mean, residuals, phi, reference_end, prefixes, allowance)
-        for j, prefix in enumerate(prefixes):
-            for column, key, label in ((0, 'NB-GLR', 'NB-surveillance-GLR'),
-                                        (1, 'Page-CUSUM', 'Page-CUSUM')):
-                calendar = int(locations[j, column])
-                results[key].append(BenchmarkResult(
-                    label, prefix - 1, float(statistics[j, column]), calendar,
-                    max(0, calendar - lag), int(directions[j, column])))
-        return results
+    statistics = np.empty((len(prefixes), 2), dtype=float)
+    locations = np.empty_like(statistics, dtype=np.int32)
+    directions = np.empty_like(locations)
     positive = negative = 0.0
     positive_start = negative_start = reference_end
     previous = reference_end
-    for prefix in prefixes:
+    for j, prefix in enumerate(prefixes):
         best_statistic, best_calendar, best_scale = -np.inf, reference_end, 1.0
         for change in range(reference_end, prefix):
             scale, statistic = _profile_nb_scale(d[change:prefix], mean[change:prefix], phi)
             if statistic > best_statistic:
                 best_statistic, best_calendar, best_scale = statistic, change, scale
-        results["NB-GLR"].append(BenchmarkResult(
-            "NB-surveillance-GLR", prefix - 1, float(best_statistic), best_calendar,
-            max(0, best_calendar - lag), int(np.sign(best_scale - 1.0))))
+        statistics[j, 0] = best_statistic
+        locations[j, 0] = best_calendar
+        directions[j, 0] = np.sign(best_scale - 1.0)
         for day in range(previous, prefix):
             value = float(residuals[day])
             if positive + value - allowance <= 0.0:
@@ -2350,11 +2360,11 @@ def surveillance_benchmark_traces(
             statistic, calendar, direction = positive, positive_start, 1
         else:
             statistic, calendar, direction = negative, negative_start, -1
-        results["Page-CUSUM"].append(BenchmarkResult(
-            "Page-CUSUM", prefix - 1, float(statistic), calendar,
-            max(0, calendar - lag), direction))
+        statistics[j, 1] = statistic
+        locations[j, 1] = calendar
+        directions[j, 1] = direction
         previous = prefix
-    return results
+    return statistics, locations, directions
 
 
 def published_benchmark_statistics(cases: Sequence[float], deaths: Sequence[int | float], delay_pmf: Sequence[float], *, reference_end: int=28, observation_start: int=0, lag_offset: int=1) -> dict[str, BenchmarkResult]:

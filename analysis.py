@@ -3757,14 +3757,16 @@ def _compact_v2_estimation_figure(tables: dict, directory: Path, *, all_cells: b
     coverage = tables['compact_v2_interval_summary']
     mapping = tables['compact_v2_estimation_cells']
     if not all_cells:
+        families = ('steady', 'sparse', 'wave')
+        ratios = (2/3, 1.5)
         wanted = []
-        for family in ('steady', 'sparse', 'wave'):
-            for ratio in (2/3, 1.25, 1.5):
+        for family in families:
+            for ratio in ratios:
                 cell = mapping[mapping.family.eq(family) & mapping.change_day.eq(92) & np.isclose(mapping.risk_ratio, ratio)]
                 if len(cell) != 1:
-                    raise EvidenceError('main v2 estimation figure requires all nine declared cells')
+                    raise EvidenceError('main v2 estimation figure requires both reciprocal risk ratios in each family')
                 wanted.append(cell.iloc[0].scenario)
-        labels = ['2/3', '1.25', '1.5']*3
+        labels = ['2/3', '1.5'] * len(families)
     else:
         wanted = mapping.sort_values('cell_index').scenario.tolist()
         labels = [str(x) for x in range(1, len(wanted)+1)]
@@ -3799,10 +3801,13 @@ def _compact_v2_estimation_figure(tables: dict, directory: Path, *, all_cells: b
             ax.tick_params(axis='x', labelsize=10.5, labelbottom=True)
             _compact_letter(ax, 'ABCDEF'[2*row+column])
             if not all_cells:
-                ax.axvspan(-.5, 2.5, color='#edf2f6', zorder=-5)
-                ax.axvspan(5.5, 8.5, color='#edf2f6', zorder=-5)
-                for pos, family in zip((1, 4, 7), ('Steady', 'Sparse', 'Wave')):
-                    ax.text(pos, 1.035, family, transform=ax.get_xaxis_transform(), ha='center', fontsize=10.5)
+                for index, family in enumerate(families):
+                    first = index * len(ratios)
+                    end = first + len(ratios)
+                    if index % 2 == 0:
+                        ax.axvspan(first-.5, end-.5, color='#edf2f6', zorder=-5)
+                    ax.text((first+end-1)/2, 1.035, family.capitalize(),
+                            transform=ax.get_xaxis_transform(), ha='center', fontsize=10.5)
     fig.text(.32, .995, 'Point estimation (lower is better)',
              ha='center', va='top', fontsize=10.5)
     fig.text(.78, .995, 'Interval coverage (target 95%)',
@@ -3836,12 +3841,224 @@ def _compact_v2_estimation_figure(tables: dict, directory: Path, *, all_cells: b
            'Indices 7-10 are sparse incidence with risk ratios 2/3, 1.25, 1.5 and 2, respectively, '
            'all at change day 92. Indices 11-16 are wave incidence in the same risk-ratio and '
            'change-day order as indices 1-6. ' if all_cells else
-           'The nine conditions shown have change day 92 and risk ratios 2/3,1.25,1.5 within each family. ')
+           'The six conditions shown have change day 92 and reciprocal risk ratios 2/3 and 1.5 '
+           'within each family, representing equal log-risk-ratio magnitudes in opposite directions. ')
         + f'Training requested n per cell: {training_n}; independent-validation requested n: {validation_n}. '
         + f'Displayed matched-point counts range from {paired_counts.min()} to {paired_counts.max()}; '
         + f'independent first-alarm denominators range from {alarm_counts.min()} to {alarm_counts.max()}. '
         'Numerical summaries report the paired counts, first-alarm denominators, estimation and interval '
         'availability, and interval widths for all 16 conditions.')
+
+
+def plot_method_overview(output_dir: Path) -> None:
+    """Draw the three schematic panels in Figure 1 from illustrative values."""
+    from contextlib import contextmanager
+    from matplotlib import _mathtext
+    from matplotlib.patches import FancyBboxPatch
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    style = {
+        "font.family": "serif", "font.size": 10.6, "axes.labelsize": 10.6,
+        "xtick.labelsize": 9.5, "ytick.labelsize": 9.5, "pdf.fonttype": 42,
+        "ps.fonttype": 42, "axes.spines.top": False, "axes.spines.right": False,
+        "savefig.bbox": None,
+    }
+    BLUE, ORANGE, PURPLE, SKY, BLACK, LIGHT = (
+        "#0072B2", "#D55E00", "#CC79A7", "#56B4E9", "#222222", "#D9D9D9",
+    )
+
+    def panel(ax, label, *, x=0.0):
+        ax.text(x, 1.19, f"({label})", transform=ax.transAxes, fontweight="bold",
+                ha="right", va="bottom", clip_on=False, fontsize=10.6)
+
+    @contextmanager
+    def math_script_scale():
+        # The paper enlarges nested math subscripts in this schematic. Keep
+        # Matplotlib's default script sizes for every other figure.
+        shrink = _mathtext.SHRINK_FACTOR
+        _mathtext.SHRINK_FACTOR = .90
+        try:
+            yield
+        finally:
+            _mathtext.SHRINK_FACTOR = shrink
+
+    with matplotlib.rc_context({**matplotlib.rcParamsDefault, **style}), math_script_scale():
+        fig, axes = plt.subplots(1, 3, figsize=(6.27, 3.05))
+        fig.subplots_adjust(left=0.045, right=0.985, bottom=0.22, top=0.78, wspace=0.32)
+
+        # (a) A confirmed-case cohort contributes to daily deaths through the delay law.
+        ax = axes[0]
+        time = np.arange(10)
+        cases = np.array([0.10, 0.22, 0.38, 0.88, 0.54, 0.32, 0.20, 0.12, 0.08, 0.04])
+        deaths = np.array([0.00, 0.00, 0.02, 0.04, 0.08, 0.18, 0.28, 0.22, 0.13, 0.07])
+        case_colors = [LIGHT] * len(time)
+        case_colors[3] = BLUE
+        ax.bar(time, cases, width=0.72, color=case_colors, edgecolor="none")
+        ax.bar(time, -deaths, width=0.72, color=ORANGE, alpha=0.78, edgecolor="none")
+        for target, weight in zip((5, 6, 7), (0.20, 0.45, 0.25), strict=True):
+            ax.annotate(
+                "",
+                xy=(target, -deaths[target] + 0.01),
+                xytext=(3, cases[3] + 0.02),
+                arrowprops={
+                    "arrowstyle": "->",
+                    "color": BLUE,
+                    "alpha": 0.35 + weight,
+                    "linewidth": 0.8 + 1.2 * weight,
+                    "connectionstyle": "arc3,rad=-0.18",
+                },
+            )
+        ax.axhline(0, color=BLACK, linewidth=0.7)
+        ax.annotate("cohort $u$", xy=(3, 0.9), xytext=(1.2, 1.02), color=BLUE,
+                    arrowprops={"arrowstyle": "-", "color": BLUE, "linewidth": 0.8})
+        ax.text(0.01, 0.80, "cohort\ncases $C_u$", color=BLUE, fontsize=9.5,
+                ha="left", transform=ax.transAxes)
+        ax.text(0.02, 0.31, "daily deaths $D_s$", color=ORANGE, fontsize=9.5,
+                ha="left", transform=ax.transAxes)
+        ax.text(5.5, 0.60, "delay\n$f_{s-u}$", color=BLUE, fontsize=9.5)
+        ax.text(3.5, -0.85, r"$X_s=\sum_{u\leq s-\ell_0}C_u f_{s-u}$", ha="center", fontsize=10.6)
+        ax.set_xlim(-2.6, 9.6)
+        ax.set_ylim(-1.20, 1.08)
+        ax.set_xticks([0, 3, 6, 9], ["earlier", "", "", "later"])
+        ax.set_yticks([])
+        ax.set_title("Cohort\nalignment", fontsize=9.5, fontweight="bold", pad=14)
+        panel(ax, "a")
+
+        # (b) The nuisance-adjusted score is scanned over eligible change cohorts.
+        ax = axes[1]
+        tau = np.arange(1, 31)
+        score = (
+            0.35
+            + 0.35 * np.sin(tau / 2.7) ** 2
+            + 7.0 * np.exp(-0.5 * ((tau - 19.0) / 2.6) ** 2)
+        )
+        ax.fill_between(tau, 0, score, color=SKY, alpha=0.18)
+        ax.plot(tau, score, color=BLUE, linewidth=1.8)
+        peak = int(np.argmax(score))
+        ax.axvline(tau[peak], color=ORANGE, linestyle="--", linewidth=1.1)
+        ax.annotate(
+            r"$\widehat\tau_t$",
+            xy=(tau[peak], score[peak]),
+            xytext=(tau[peak] + 3.0, score[peak] - 1.1),
+            color=ORANGE,
+            arrowprops={"arrowstyle": "->", "color": ORANGE, "linewidth": 0.9},
+        )
+        # Explicitly positioned limit avoids a false whole-span collision from
+        # the mathematical max operator; the equation is unchanged.
+        for x, y, text, size, ha in (
+            (0.04, 0.96, r"$M_t=$", 10.6, 'left'),
+            (0.43, 0.96, r"$\max$", 10.6, 'center'),
+            (0.43, 0.83, r"$\tau\in\mathcal{K}_t$", 9.5, 'center'),
+            (0.64, 0.96, r"$Z_t^2(\tau)$", 10.6, 'left'),
+        ):
+            ax.text(x, y, text, transform=ax.transAxes, ha=ha, va='top', fontsize=size)
+        ax.set_xlim(1, 30)
+        ax.set_ylim(0, 11.5)
+        ax.set_xlabel("eligible cohort\nchange day $\\tau$")
+        ax.set_ylabel(r"score $Z_t^2(\tau)$")
+        ax.set_xticks([1, 10, 20, 30])
+        ax.set_yticks([0, 4, 8])
+        ax.set_title("Efficient-score\nscan", fontsize=9.5, fontweight="bold", pad=14)
+        panel(ax, "b")
+
+        # (c) Planned looks are compared with conditional Gaussian multiplier boundaries.
+        ax = axes[2]
+        looks = np.arange(1, 8)
+        boundary = np.array([7.8, 8.1, 8.0, 8.3, 8.4, 8.5, 8.5])
+        # The sixth look is the first strict exceedance of the boundary.
+        statistic = np.array([2.1, 3.0, 3.7, 5.8, 7.4, 9.2, 12.0])
+        ax.fill_between(looks, 0, boundary, color=PURPLE, alpha=0.10)
+        ax.plot(looks, boundary, color=PURPLE, linestyle="--", linewidth=1.5)
+        ax.plot(looks, statistic, color=BLACK, linewidth=1.8)
+        crossing = 5
+        ax.vlines(
+            looks[crossing],
+            2.15,
+            boundary[crossing],
+            color=ORANGE,
+            linestyle=":",
+            linewidth=1.0,
+            zorder=2,
+        )
+        ax.plot(
+            looks[crossing],
+            statistic[crossing],
+            marker="v",
+            color=ORANGE,
+            markersize=6,
+            linestyle="none",
+            zorder=5,
+        )
+        ax.annotate(
+            "first alarm",
+            xy=(looks[crossing], statistic[crossing]),
+            xytext=(2.25, 11.9),
+            color=ORANGE,
+            arrowprops={"arrowstyle": "->", "color": ORANGE, "linewidth": 0.9},
+        )
+        ax.text(1.15, boundary[0] + 1.3, "multiplier\ncutoff $c_j$", color=PURPLE, fontsize=10.6)
+        ax.text(6.0, statistic[-1] + 0.8, r"$M_t$", color=BLACK, fontsize=10.6)
+        output = FancyBboxPatch(
+            (1.15, 0.35),
+            5.8,
+            1.6,
+            boxstyle="round,pad=0.02,rounding_size=0.16",
+            linewidth=0.7,
+            edgecolor=ORANGE,
+            facecolor="#FFF3EA",
+            zorder=3,
+        )
+        ax.add_patch(output)
+        ax.text(
+            3.98,
+            1.15,
+            r"$T$  |  $\widehat\tau_T$  |  direction",
+            ha="center",
+            va="center",
+            fontsize=9.5,
+            zorder=4,
+        )
+        ax.set_xlim(1, 7.15)
+        ax.set_ylim(0, 14.0)
+        ax.set_xlabel("planned look")
+        ax.set_ylabel("scan statistic")
+        ax.set_xticks(looks)
+        ax.set_yticks([0, 4, 8, 12])
+        # The long third-panel title otherwise touches the panel tag after
+        # reduction to the manuscript's portrait width.
+        ax.set_title(
+            "Sequential\ncalibration",
+            fontsize=9.5,
+            fontweight="bold",
+            pad=14,
+            x=0.54,
+        )
+        panel(ax, "c", x=-0.035)
+
+        # Keep a fixed canvas to preserve the panel spacing and physical font sizes.
+        for suffix, dpi in (("pdf", None), ("png", 600)):
+            fig.savefig(output_dir / f"Fig1_method_overview.{suffix}", dpi=dpi)
+        plt.close(fig)
+
+
+def analyze_paper_estimation(output: Path, figure_dir: Path) -> dict[str, pd.DataFrame]:
+    """Export the current Figure 5 and its full-design point and interval tables."""
+    tables, evidence = _compact_load_v2_postalarm(output)
+    if evidence["status"] != "complete":
+        raise EvidenceError("Figure 5 requires the complete independent and calibration estimation banks")
+    destination = output / "analysis"
+    figure_dir.mkdir(parents=True, exist_ok=True)
+    _compact_style()
+    name = "CompactFig5_estimation"
+    caption = _compact_v2_estimation_figure(tables, figure_dir)
+    (figure_dir / f"{name}_caption.txt").write_text(caption + "\n", encoding="utf-8")
+    for key in ("compact_v2_ls_summary", "compact_v2_interval_summary", "compact_v2_estimation_cells"):
+        _atomic_csv(tables[key], destination / f"{key}.csv")
+    _atomic_json({"status": "complete", "estimation_evidence": evidence,
+                  "figure_sha256": _sha256(figure_dir / f"{name}.pdf"),
+                  "analysis_source_sha256": _sha256(Path(__file__))},
+                 destination / "paper_estimation_manifest.json")
+    return tables
 
 
 def _interval_atomic_json(path: Path, value: object) -> None:
@@ -4261,6 +4478,23 @@ def analyze_paired_detection(output: Path, figure_dir: Path | None = None) -> di
     tables["paired_detection_evidence_sources"] = all_rows.groupby(
         ["evidence_stage", "stage", "scenario", "method"], as_index=False).agg(
         requested_rows=("replicate", "size"))
+
+    # The historical runners retain four ascertainment conditions. The paper's
+    # scenario allocation and evaluation summary include the other 41 cells.
+    paper_cells = all_rows.loc[all_rows.stage.ne("audit")
+                               & ~all_rows.misspecification.str.startswith("exposure_scale_")
+                               & all_rows.method.eq("OCFR")]
+    design_columns = ["scenario", "family", "split", "horizon", "change_day",
+                      "risk_ratio", "phi", "true_delay_mean_days", "assumed_delay_mean_days",
+                      "misspecification"]
+    tables["evaluation_design"] = (paper_cells.groupby(design_columns, as_index=False)
+                                   .agg(n=("replicate", "size")).rename(columns={"scenario": "name"}))
+    if len(tables["evaluation_design"]) != 41:
+        raise EvidenceError("current paper evaluation requires 41 retained conditions")
+    paper_summary = pd.concat([tables["compact_summary"], dispersion], ignore_index=True)
+    tables["evaluation_summary"] = paper_summary.loc[paper_summary.scenario.isin(paper_cells.scenario.unique())]
+    tables["null_audit"] = tables["compact_summary"].loc[
+        tables["compact_summary"].stage.eq("audit") & tables["compact_summary"].metric.eq("alarm_probability")]
 
     figures = Path(figure_dir).resolve() if figure_dir is not None else destination / "figures"
     figures.mkdir(parents=True, exist_ok=True)

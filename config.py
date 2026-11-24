@@ -393,6 +393,20 @@ def get_compact_release_study_config(*, backend: str | None = None) -> Experimen
                    split_replications=COMPACT_RELEASE_REPLICATION_PLAN)
 
 
+def get_boundary_ablation_configs(mode: Mode) -> tuple[ExperimentConfig, ExperimentConfig]:
+    """Independent wave banks for the appendix's within-episode comparison."""
+    base = get_compact_experiment_config(mode, backend="python")
+    scenarios = {scenario.name: scenario for scenario in base.scenarios}
+    # The historical null output was labelled wave_null, but its input was
+    # wave_audit. Retain the original size_audit split and death stream group.
+    audit = replace(base, master_seed=2026111612, scenarios=(scenarios["wave_audit"],),
+                    replications=2_000 if mode == "full" else 10)
+    alternatives = replace(base, master_seed=2026111613,
+                           scenarios=tuple(scenarios[f"wave_{label}"]
+                                           for label in ("rr067", "rr125", "rr150")))
+    return audit, alternatives
+
+
 def get_post_alarm_validation_config(protocol: str) -> PostAlarmValidationConfig:
     if protocol == "compact-v2":
         return PostAlarmValidationConfig(2026111405, GAUSSIAN_SPENDING_POLICY)
