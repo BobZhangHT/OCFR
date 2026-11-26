@@ -20,7 +20,7 @@ realized numerical bank. Both use the same boundary construction.
 | `methods.py` | Portable detectors, estimators, intervals, samplers and C bindings. |
 | `simulation.py` | Parallel experiments, atomic caches, resume and scoped reset. |
 | `analysis.py` | Simulation summaries, interval calibration and publication figures. |
-| `real_data.py` | Public-data download, preprocessing, monitoring and application figures. |
+| `real_data.py` | Download, preprocessing, replay, benchmark calibration, null audits and figures for all surveillance series. |
 | `csrc/ocfr_kernels.c` | C acceleration and matched random sampling. |
 
 The repository contains code, tests and essential documentation. Downloaded
@@ -65,7 +65,7 @@ This command trains the fixed thresholds, audits false alarms on independent
 null replications, compares detection and localization, runs the sensitivity
 and boundary studies, and evaluates post-alarm estimation. The paper's
 simulation figures and their tables are written under `outputs/paper`.
-Figure 1 uses illustrative values. Figs. 2?6 and the simulation tables use the
+Figure 1 uses illustrative values. Figures 2 through 6 and the simulation tables use the
 newly computed results.
 
 The study uses 10,000 null-training and 5,000 null-audit replications for each
@@ -110,7 +110,8 @@ through their explicit names.
 ### Historical surveillance applications
 
 The current protocol replays WHO COVID-19 surveillance for Japan, South Korea,
-and the United Kingdom and SINAN pandemic influenza surveillance from Brazil.
+and the United Kingdom and the 2018 seasonal A(H1N1)pdm09 surveillance series
+from Brazil.
 The two data sources are the [WHO dashboard][who] and [Brazil's SINAN
 Influenza archive][sinan]. The WHO data use case and death report dates.
 The SINAN data use symptom-onset and death-occurrence dates for hospitalized,
@@ -132,19 +133,26 @@ command with that directory. The command uses these files offline. Use
 `--stage fetch` to generate the upstream provenance and record-flow counts
 separately. The two files required for an offline replay are
 `processed/who_covid_processed.csv` and
-`processed/brazil_influenza_daily.csv`.
+`processed/brazil_2018_influenza_daily.csv`.
 
 ```bash
 ocfr-real-data --stage benchmarks --data data/paper --output outputs/surveillance --workers 8 --require-manuscript-inputs
 ocfr-real-data --stage audit --data data/paper --output outputs/surveillance --workers 8 --require-manuscript-inputs
+ocfr-real-data --stage audit --brazil-common-calendar --data data/paper --output outputs/surveillance --workers 8 --require-manuscript-inputs
+ocfr-real-data --stage clinical-delay --data data/paper --output outputs/surveillance --require-manuscript-inputs
 ```
 
 The main replay writes the four OCFR series, delay and calendar
-sensitivity analyses, residual summaries, and Figs. 7?8. The benchmark command
+sensitivity analyses, residual summaries, and Figures 7 and 8. The benchmark command
 runs NB-GLR and Page CUSUM with look-specific calibration from each observed
 prefix, retaining its first-alarm dates and the independent null-path
-diagnostics. The audit command runs the separate OCFR null audits conditional
-on the archived case series. Defaults retain 10,000 paths for application
+diagnostics. In Brazil, OCFR uses 49 weekly analyses starting 27 January.
+The benchmarks fit a fixed baseline over the first 13 epidemiological
+weeks and use 39 weekly analyses starting 7 April. The two audit commands
+run OCFR null audits conditional on the archived case series. The
+clinical-delay command constructs the longer exploratory Brazilian delay
+from dated fatal outcomes and downloads the raw SINAN releases when they are absent.
+Defaults retain 10,000 paths for application
 boundaries, 10,000 training paths and 10,000 independent validation paths
 for benchmark cutoffs, and 1,000 replications per OCFR null audit.
 
@@ -154,7 +162,7 @@ below its boundary leaves the earlier alarm in the trace. See the CLI help
 for backend choices, short-run counts and the earlier dengue example.
 
 [who]: https://data.who.int/dashboards/covid19/data
-[sinan]: https://dadosabertos.saude.gov.br/dataset/srag-2009-2012
+[sinan]: https://dadosabertos.saude.gov.br/dataset/srag-2013-2018
 
 ## Use the detector independently
 

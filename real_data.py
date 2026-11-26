@@ -19,8 +19,6 @@ from typing import Any
 
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-from matplotlib.lines import Line2D
-from matplotlib.ticker import MaxNLocator
 import numpy as np
 import pandas as pd
 from scipy.integrate import quad
@@ -280,8 +278,7 @@ def prepare_covid(data_dir: Path, config: RealDataConfig, *, refresh: bool,
     }
 
 
-# Replay specifications fix the counting clock, starts and seeds before any
-# prefix is inspected. Reference ends are exclusive zero-based prefix lengths.
+# Replay specifications record the counting clock, analysis calendar and seeds.
 @dataclass(frozen=True)
 class SurveillanceReplay:
     name: str
@@ -294,6 +291,7 @@ class SurveillanceReplay:
     benchmark_reference_last: str
     lag_offset: int
     seed: int
+    audit_reference_last: str | None = None
 
     def index(self, day: str) -> int:
         return (pd.Timestamp(day) - pd.Timestamp(self.history_start)).days
@@ -302,6 +300,11 @@ class SurveillanceReplay:
     def looks(self) -> tuple[int, ...]:
         calendar = pd.date_range(self.first_look, self.horizon, freq='7D')
         return tuple(self.index(day) + 1 for day in calendar.union([pd.Timestamp(self.horizon)]))
+
+    @property
+    def benchmark_looks(self) -> tuple[int, ...]:
+        end = self.index(self.benchmark_reference_last) + 1
+        return tuple(prefix for prefix in self.looks if prefix > end)
 
 
 SURVEILLANCE_REPLAYS = {
@@ -315,83 +318,119 @@ SURVEILLANCE_REPLAYS = {
         ('united_kingdom', 'United Kingdom', 'United Kingdom of Great Britain and Northern Ireland'),
     ))
 }
+# The sparse January prefix motivates a weeks 1–13 reference for the benchmark
+# and case-conditional audit. The OCFR observed replay keeps its January start.
 SURVEILLANCE_REPLAYS['brazil'] = SurveillanceReplay(
-    'Brazil influenza', None, '2009-06-04', '2009-07-19', '2009-08-02',
-    '2009-08-15', '2010-01-02', '2009-08-14', 0, 2026112101,
+    'Brazil 2018 seasonal A(H1N1)pdm09', None, '2017-11-16', '2017-12-31', '2018-01-14',
+    '2018-01-27', '2018-12-29', '2018-03-31', 0, 2026112101, audit_reference_last='2018-03-31',
 )
-SINAN_URL = 'https://d26692udehoye.cloudfront.net/SRAG/2009-2012/'
-SINAN_FILES = ('INFLUD09.csv', 'INFLUD10.csv')
+BRAZIL_DAILY_FILE = 'brazil_2018_influenza_daily.csv'
+BRAZIL_SOURCES = {
+    'INFLUD17.csv': ('https://d26692udehoye.cloudfront.net/SRAG/2013-2018/INFLUD17.csv',
+                     'RES_FLUASU', 'DT_OBITO', '%d/%m/%Y'),
+    'INFLUD18.csv': ('https://d26692udehoye.cloudfront.net/SRAG/2013-2018/INFLUD18.csv',
+                     'RES_FLUASU', 'DT_OBITO', '%d/%m/%Y'),
+    'INFLUD19-23-03-2026.csv': (
+        'https://s3.sa-east-1.amazonaws.com/ckan.saude.gov.br/SRAG/2019/INFLUD19-23-03-2026.csv',
+        'PCR_FLUASU', 'DT_EVOLUCA', '%Y-%m-%d',
+    ),
+}
 BRAZIL_DELAY_LAWS = {'ejima': (9.5, 4.7**2), 'nishiura': (9., 39.7)}
 # These hashes are for the exact analyzed aggregates with LF line endings.
 MANUSCRIPT_INPUT_SHA256 = {
     'who_covid_processed.csv': '4f160c6817d4c15ce61ceb6831c1366277594c2db4d2852ec4be9977801ddd3e',
-    'brazil_influenza_daily.csv': 'fb8c99f9d19f144c2ee34c4b671a5e08c3403269a3b20ae428d61020640e69df',
+    BRAZIL_DAILY_FILE: '38f1f97430880902637780b549b5300a9b9af0fcc43e110605b6791e82be7639',
 }
 
 
 def brazil_delay(law: str = 'ejima') -> np.ndarray:
     """Discretize the onset-to-death Gamma law in half-day bins on lags 0–45."""
-    mean, variance = BRAZIL_DELAY_LAWS[law]
+    return _brazil_gamma_delay(*BRAZIL_DELAY_LAWS[law])
+
+
+def _brazil_gamma_delay(mean: float, variance: float) -> np.ndarray:
     mass = np.diff(gamma.cdf(np.r_[0, np.arange(46) + .5],
                             a=mean**2 / variance, scale=variance / mean))
     return mass / mass.sum()
 
 
 def prepare_brazil(data_dir: Path, *, refresh: bool = False) -> dict[str, Any]:
-    """Build the daily SINAN aggregate and appendix record-flow diagnostics."""
+    """Aggregate the 2018 season from the adjacent national SRAG releases."""
     replay = SURVEILLANCE_REPLAYS['brazil']
     dates = pd.date_range(replay.history_start, replay.horizon)
-    fields = ('DT_SIN_PRI', 'DT_OBITO', 'DT_NOTIFIC', 'DT_ENCERRA',
-              'CLASSI_FIN', 'CRITERIO', 'HOSPITAL', 'EVOLUCAO')
-    inputs, eligible, exclusions = {}, [], {}
-    for name in SINAN_FILES:
-        source = SINAN_URL + name
+    inputs, eligible = {}, []
+    for name, (source, subtype, outcome_date, date_format) in BRAZIL_SOURCES.items():
+        date_fields = ('DT_SIN_PRI', 'DT_NOTIFIC', outcome_date)
+        eligibility_fields = ['CLASSI_FIN', 'CRITERIO', 'HOSPITAL', subtype]
+        fields = (*date_fields, *eligibility_fields, 'EVOLUCAO', 'DT_NASC', 'CS_SEXO')
         raw = _cached_download(source, data_dir / 'raw' / name, refresh=refresh)
         records = pd.read_csv(io.BytesIO(raw), sep=';', encoding='latin1', usecols=fields, dtype=str)
-        # Code 1 in all three fields selects hospitalized, lab-confirmed novel influenza.
-        rows = records.loc[records.HOSPITAL.eq('1') & records.CRITERIO.eq('1')
-                           & records.CLASSI_FIN.eq('1')].copy()
-        for column in fields[:4]:
-            rows[column] = pd.to_datetime(rows[column], format='%d/%m/%Y', errors='coerce')
-        rows['onset'] = rows.DT_SIN_PRI
-        rows['death'] = rows.DT_OBITO.where(rows.EVOLUCAO.eq('2'))
+        for column in (*eligibility_fields, 'EVOLUCAO'):
+            records[column] = records[column].str.replace(r'\.0$', '', regex=True)
+        for column in date_fields:
+            records[column] = pd.to_datetime(records[column].str[:10], format=date_format,
+                                             errors='coerce')
+        if len(records) and records.DT_SIN_PRI.isna().all():
+            raise ValueError(f'{name}: could not parse any onset dates.')
+        # Code 1 in the four fields selects hospitalized, lab-confirmed A(H1N1)pdm09.
+        rows = records.loc[records[eligibility_fields].eq('1').all(axis=1)].rename(
+            columns={'DT_SIN_PRI': 'onset', 'DT_NOTIFIC': 'notification'})
+        rows['death'] = rows[outcome_date].where(rows.EVOLUCAO.eq('2'))
         relevant = rows.onset.between(dates[0], dates[-1])
         invalid = rows.death.lt(rows.onset)
-        selected = rows.loc[relevant & ~invalid]
+        selected = rows.loc[relevant & ~invalid, [
+            'onset', 'death', 'notification', 'EVOLUCAO', 'DT_NASC', 'CS_SEXO',
+        ]].assign(release=name)
         eligible.append(selected)
-        exclusions[name] = int((relevant & invalid).sum())
         inputs[name] = dict(url=source, sha256=_sha256(raw), source_rows=len(records),
-                            eligible_records=len(selected), missing_onset=int(rows.onset.isna().sum()))
+                            eligible_all=len(rows), eligible_records=len(selected),
+                            missing_onset=int(rows.onset.isna().sum()),
+                            negative_date_order_exclusions=int((relevant & invalid).sum()),
+                            prehistory_onsets=int(selected.onset.lt(replay.outcome_start).sum()),
+                            monitored_onsets=int(selected.onset.ge(replay.outcome_start).sum()),
+                            monitored_deaths=int(selected.death.between(replay.outcome_start, replay.horizon).sum()))
 
     # Separate date axes retain deaths from earlier onset cohorts. Undated
     # outcomes remain in the onset counts and contribute zero dated deaths.
     cohort = pd.concat(eligible, ignore_index=True)
+    release_counts = cohort.groupby(['DT_NASC', 'CS_SEXO', 'onset'], dropna=False).release.nunique()
+    cross_release_matches = int(release_counts.gt(1).sum())
+    if cross_release_matches:
+        raise ValueError(f'Inspect {cross_release_matches} cross-release demographic and onset matches.')
     counts = pd.DataFrame({
         'date': dates,
         'cases': cohort.onset.value_counts().reindex(dates, fill_value=0).to_numpy(),
         'deaths': cohort.death.value_counts().reindex(dates, fill_value=0).to_numpy(),
     })
     monitored = cohort.loc[cohort.onset.ge(replay.outcome_start)]
-    through_first_look = monitored.loc[monitored.onset.le(replay.first_look)]
-    output = data_dir / 'processed' / 'brazil_influenza_daily.csv'
+    output = data_dir / 'processed' / BRAZIL_DAILY_FILE
     output.parent.mkdir(parents=True, exist_ok=True)
-    counts.to_csv(output, index=False, date_format='%Y-%m-%d')
+    counts.to_csv(output, index=False, date_format='%Y-%m-%d', lineterminator='\n')
+    notification_at_planned_looks = {}
+    for prefix in replay.looks:
+        day = dates[prefix - 1]
+        through_look = monitored.loc[monitored.onset.le(day)]
+        notification_at_planned_looks[day.date().isoformat()] = {
+            'archived_onsets': len(through_look),
+            'notified_after_look': int(through_look.notification.gt(day).sum()),
+            'missing_notification_date': int(through_look.notification.isna().sum()),
+        }
+    delay = (monitored.death - monitored.onset).dt.days.dropna()
     return {
         'inputs': inputs, 'processed_file': output.name, 'rows': len(counts),
-        'negative_date_order_exclusions': sum(exclusions.values()),
+        'negative_date_order_exclusions': sum(x['negative_date_order_exclusions'] for x in inputs.values()),
+        'cross_release_fingerprint_matches': cross_release_matches,
         'deaths_without_date': int((cohort.EVOLUCAO.eq('2') & cohort.death.isna()).sum()),
+        'deaths_after_horizon': int(cohort.death.gt(replay.horizon).sum()),
         'prehistory_cases': int(counts.iloc[:replay.index(replay.outcome_start)].cases.sum()),
         'monitored_cohort_cases': len(monitored),
         'monitored_deaths': int(counts.iloc[replay.index(replay.outcome_start):].deaths.sum()),
         'outcomes_for_monitored_cohorts': monitored.EVOLUCAO.fillna('missing').value_counts().to_dict(),
-        'median_observed_delay_days': float((cohort.death - cohort.onset).dt.days.median()),
-        'notification_at_first_look': {
-            'archived_onsets_through_alarm': len(through_first_look),
-            'first_notified_after_alarm': int(through_first_look.DT_NOTIFIC.gt(replay.first_look).sum()),
-            'missing_notification_date': int(through_first_look.DT_NOTIFIC.isna().sum()),
-            'investigation_closed_after_alarm': int(through_first_look.DT_ENCERRA.gt(replay.first_look).sum()),
-            'missing_closure_date': int(through_first_look.DT_ENCERRA.isna().sum()),
-        },
+        'median_observed_delay_days': float(delay.median()) if len(delay) else None,
+        'clinical_delay_moments': dict(dated_deaths=len(delay),
+                                       mean_days=float(delay.mean()) if len(delay) else None,
+                                       variance_days_squared=float(delay.var(ddof=1)) if len(delay) > 1 else None),
+        'notification_at_planned_looks': notification_at_planned_looks,
     }
 
 
@@ -407,7 +446,7 @@ def _surveillance_input_hashes(data_dir: Path) -> dict[str, str]:
 
 
 def prepare_surveillance(data_dir: Path, *, refresh: bool = False) -> dict[str, Any]:
-    """Fetch the current paper's public WHO and SINAN downloads."""
+    """Fetch the current paper's public WHO and Brazilian SRAG downloads."""
     metadata = {
         'covid': prepare_covid(data_dir, REAL_DATA, refresh=refresh, strict=True),
         'brazil': prepare_brazil(data_dir, refresh=refresh),
@@ -425,6 +464,7 @@ def prepare_surveillance(data_dir: Path, *, refresh: bool = False) -> dict[str, 
         'other_deaths_monitored_cohorts': outcomes.get('3', 0),
         'missing_or_unknown_outcomes_monitored_cohorts': outcomes.get('missing', 0) + outcomes.get('9', 0),
         'coded_influenza_deaths_without_death_date_all_cohorts': brazil['deaths_without_date'],
+        'coded_influenza_deaths_after_horizon': brazil['deaths_after_horizon'],
         'dated_influenza_deaths_during_monitoring': brazil['monitored_deaths'],
     }
     pd.Series(record_flow, name='count').rename_axis('definition').to_csv(
@@ -553,8 +593,14 @@ def _two_rate_intervals(
         result['interval_status'] = 'failed:regularized_fit_nonconvergence'
         return result
     try:
+        informative = active & (total > 0)
+        covariance_design = design[informative]
+        if np.any(deaths[active & ~informative] > 0) or np.any(covariance_design < -MU_FLOOR):
+            raise ValueError('Invalid exposure for two-rate covariance.')
+        # Structural-zero rows contribute no information to this covariance.
+        # Roundoff in subtracting the post-change exposure can create tiny negative values.
         intervals = regularized_parameter_intervals(
-            fit, np.zeros(int(active.sum()), dtype=float), design[active],
+            fit, np.zeros(int(informative.sum())), np.maximum(covariance_design, 0.),
             precision=reporting.precision, confidence=reporting.confidence,
             covariance=reporting.covariance,
         )
@@ -736,7 +782,7 @@ def monitor_series(
 
 
 def _surveillance_frame(data_dir: Path, replay: SurveillanceReplay) -> pd.DataFrame:
-    filename = 'who_covid_processed.csv' if replay.source_series else 'brazil_influenza_daily.csv'
+    filename = 'who_covid_processed.csv' if replay.source_series else BRAZIL_DAILY_FILE
     path = data_dir / 'processed' / filename
     if not path.exists():
         raise FileNotFoundError(f'{path} is missing. Run the fetch stage first.')
@@ -777,12 +823,16 @@ def _sensitivity_replays(key, frame, replay, primary, backend, boundary_policy):
     def retain(label, result, **settings):
         record, trace = result
         first_eligible = trace.loc[trace.candidate_count.gt(0), 'look_date']
+        usable = trace.candidate_count.gt(0) & np.isfinite(trace.critical_value)
+        first_alarm = trace.loc[trace.crossed].head(1)
         summary_rows.append({
             'series': replay.name, 'sensitivity_id': label, **settings,
             'first_planned': trace.look_date.iloc[0], 'planned_looks': len(trace),
             'first_eligible': first_eligible.iloc[0] if len(first_eligible) else None,
+            'usable_looks': int(usable.sum()),
+            'alarm_usable_ordinal': int(usable.cumsum().loc[first_alarm.index[0]]) if len(first_alarm) else None,
             **{name: record.get(name) for name in ('alarm_date', 'estimated_change_date',
-                   'statistic_at_alarm', 'boundary_at_alarm', 'risk_ratio')},
+                   'statistic_at_alarm', 'boundary_at_alarm', 'pre_cfr', 'post_cfr', 'risk_ratio')},
         })
         trace_rows.append(trace.assign(sensitivity_id=label))
 
@@ -801,6 +851,13 @@ def _sensitivity_replays(key, frame, replay, primary, backend, boundary_policy):
                     )
                     retain(label, result, law=law, mean_delay=mean, shape=mean**2 / variance,
                            first_candidate=frame.date.iloc[candidate].date().isoformat())
+        # Compare alarm timing on the calendar available to the fixed-reference
+        # charts while retaining OCFR's original likelihood and candidate grid.
+        for law, (mean, variance) in BRAZIL_DELAY_LAWS.items():
+            result = _ocfr_replay(frame, replay, brazil_delay(law), backend, boundary_policy,
+                                  first_look=replay.benchmark_looks[0])
+            retain(f'brazil-{law}-common-calendar', result, law=law, mean_delay=mean,
+                   shape=mean**2 / variance, first_candidate=replay.first_candidate)
     else:
         specs = [(float(mean), 4., replay.first_candidate) for mean in (11, 13, 14, 15, 17)]
         if key == 'south_korea':
@@ -849,6 +906,10 @@ def run_surveillance(data_dir: Path, output_dir: Path, *, backend: str = 'python
             outcome_start=replay.outcome_start, first_candidate=replay.first_candidate,
             first_look=replay.first_look, horizon=replay.horizon, n_observations=len(frame),
             n_looks=len(replay.looks), lag_offset=replay.lag_offset,
+            benchmark_reference_last=replay.benchmark_reference_last,
+            benchmark_first_look=frame.date.iloc[replay.benchmark_looks[0] - 1].date().isoformat(),
+            benchmark_looks=len(replay.benchmark_looks),
+            audit_reference_last=frame.date.iloc[_audit_reference_end(replay) - 1].date().isoformat(),
         ))
     summary_frame = pd.DataFrame(summaries)
     products = {
@@ -864,33 +925,79 @@ def run_surveillance(data_dir: Path, output_dir: Path, *, backend: str = 'python
     return summary_frame
 
 
+def run_brazil_clinical_delay(data_dir: Path, output_dir: Path, *, backend: str = 'python',
+                             boundary_policy: str = GAUSSIAN_SPENDING_POLICY) -> pd.DataFrame:
+    """Replay an exploratory Gamma law fitted to finalized seasonal death dates."""
+    provenance_path = data_dir / 'processed' / 'surveillance_provenance.json'
+    if not provenance_path.is_file():
+        raise FileNotFoundError('Run the fetch stage to prepare the aggregate clinical delay moments.')
+    source = json.loads(provenance_path.read_text(encoding='utf-8'))
+    if source['analyzed_sha256'][BRAZIL_DAILY_FILE] != _surveillance_input_hashes(data_dir)[BRAZIL_DAILY_FILE]:
+        raise ValueError('The seasonal counts changed after aggregation. Run the fetch stage again.')
+    brazil = source['brazil']
+    moments = brazil.get('clinical_delay_moments')
+    if moments is None:
+        raise ValueError('Run the fetch stage to prepare the aggregate clinical delay moments.')
+    mean, variance = moments.get('mean_days'), moments.get('variance_days_squared')
+    if (mean is None or variance is None or not np.isfinite([mean, variance]).all()
+            or min(mean, variance) <= 0):
+        raise ValueError('The exploratory Gamma law requires finite positive mean and variance from dated deaths.')
+    replay = SURVEILLANCE_REPLAYS['brazil']
+    frame = _surveillance_frame(data_dir, replay)
+    delay = _brazil_gamma_delay(mean, variance)
+    record, trace = _ocfr_replay(frame, replay, delay, backend, boundary_policy)
+    settings = dict(
+        scope='exploratory delay estimated from finalized seasonal records', moments=moments,
+        raw_sha256={name: item['sha256'] for name, item in brazil['inputs'].items()},
+        gamma_shape=mean**2 / variance, gamma_scale=variance / mean, delay=delay.tolist(),
+        replay=record.pop('provenance'),
+    )
+    result = pd.DataFrame([record])
+    _write_surveillance_outputs(data_dir, output_dir, 'clinical_delay_manifest.json',
+                                {'clinical_delay_summary.csv': result, 'clinical_delay_trace.csv': trace},
+                                settings)
+    return result
+
+
+def _audit_reference_end(replay):
+    if replay.audit_reference_last is None:
+        return replay.looks[0] - 1
+    return replay.index(replay.audit_reference_last) + 1
+
+
 def _audit_reference(frame, replay, delay):
     cases, deaths = (frame[field].to_numpy(float) for field in ('cases', 'deaths'))
-    start, end = replay.index(replay.outcome_start), replay.looks[0] - 1
+    start, end = replay.index(replay.outcome_start), _audit_reference_end(replay)
     fit = fit_score_null(cases[:end], deaths[:end], delay,
                          observation_start=start, lag_offset=replay.lag_offset)
     exposure, _ = exposure_components(cases, delay, lag_offset=replay.lag_offset)
-    if not fit.success or np.any(exposure[start:] <= MU_FLOOR):
-        raise RuntimeError(f'{replay.name}: audit requires a successful reference fit and positive exposure.')
+    if not fit.success or np.any((exposure[start:] <= MU_FLOOR) & (deaths[start:] > 0)):
+        raise RuntimeError(f'{replay.name}: audit requires a successful reference fit and exposure for observed deaths.')
+    exposure[exposure <= MU_FLOOR] = 0.
     return fit, fit.pi * exposure, start, end
 
 
 def _surveillance_residuals(frame, replay, delay):
     fit, mean, start, end = _audit_reference(frame, replay, delay)
     deaths = frame.deaths.to_numpy(float)
-    pearson = (deaths[start:] - mean[start:]) / np.sqrt(nb_variance(mean[start:], fit.phi))
+    active = mean[start:] > 0
+    pearson = np.full(len(mean) - start, np.nan)
+    pearson[active] = ((deaths[start:][active] - mean[start:][active])
+                       / np.sqrt(nb_variance(mean[start:][active], fit.phi)))
     reference, later = pearson[:end-start], pearson[end-start:]
 
     def lag_one(values):
-        return float(np.corrcoef(values[:-1], values[1:])[0, 1])
+        adjacent = np.isfinite(values[:-1]) & np.isfinite(values[1:])
+        return float(np.corrcoef(values[:-1][adjacent], values[1:][adjacent])[0, 1])
 
     summary = dict(series=replay.name, reference_risk=float(fit.pi),
                    reference_shape=float(fit.phi), reference_days=end-start,
-                   reference_pearson_sd=float(reference.std(ddof=1)),
+                   reference_active_days=int(active[:end-start].sum()),
+                   reference_pearson_sd=float(np.nanstd(reference, ddof=1)),
                    reference_acf_lag1=lag_one(reference),
-                   all_active_pearson_mean=float(pearson.mean()),
+                   all_active_pearson_mean=float(np.nanmean(pearson)),
                    all_active_acf_lag1=lag_one(pearson),
-                   later_pearson_mean=float(later.mean()), later_acf_lag1=lag_one(later))
+                   later_pearson_mean=float(np.nanmean(later)), later_acf_lag1=lag_one(later))
     residuals = pd.DataFrame(dict(series=replay.name, date=frame.date.iloc[start:],
                                   deaths=deaths[start:], mean_reference_prediction=mean[start:],
                                   pearson_residual=pearson))
@@ -899,11 +1006,12 @@ def _surveillance_residuals(frame, replay, delay):
 
 def _surveillance_audit_replicate(task):
     key, replay, delay, cases, mean, phi, start, looks, replicate, paths, backend = task
-    # The archived Brazil and COVID experiments used different stream keys.
-    # Splitting each stream separates the case-conditional NB draws from the
+    # Splitting each replay's stream separates the case-conditional NB draws from the
     # Gaussian bank, and the full bank is shared over looks within a replicate.
     if key == 'brazil':
-        seed = np.random.SeedSequence([2026112117, 0, replicate])
+        # The primary and common-calendar audits have disjoint simulation banks.
+        root_seed = 2026112118 if looks == replay.benchmark_looks else 2026112117
+        seed = np.random.SeedSequence([root_seed, 0, replicate])
     else:
         digest = hashlib.sha256(f'2026111621|{replay.name}|{replicate}'.encode()).digest()
         seed = np.random.SeedSequence(int.from_bytes(digest[:8], 'little'))
@@ -939,17 +1047,21 @@ def _surveillance_audit_replicate(task):
 
 def run_surveillance_null_audits(data_dir: Path, output_dir: Path, *, replications: int = 1000,
                                  n_paths: int = 10000, workers: int = 1,
-                                 backend: str | None = None) -> pd.DataFrame:
+                                 backend: str | None = None,
+                                 brazil_common_calendar: bool = False) -> pd.DataFrame:
     """Generate independent constant-risk audits conditional on observed case paths."""
     if min(replications, n_paths, workers) < 1:
         raise ValueError('Replication, path and worker counts must be positive.')
     rows, summaries, settings = [], [], {}
-    for key, replay in SURVEILLANCE_REPLAYS.items():
+    replays = ({'brazil': SURVEILLANCE_REPLAYS['brazil']} if brazil_common_calendar
+               else SURVEILLANCE_REPLAYS)
+    for key, replay in replays.items():
         frame = _surveillance_frame(data_dir, replay)
         delay = _primary_delay(replay)
         fit, mean, start, end = _audit_reference(frame, replay, delay)
         choices = backend or ('c' if key == 'brazil' else 'python')
-        fixed = (key, replay, delay, frame.cases.to_numpy(float), mean, fit.phi, start, replay.looks)
+        looks = replay.benchmark_looks if brazil_common_calendar else replay.looks
+        fixed = (key, replay, delay, frame.cases.to_numpy(float), mean, fit.phi, start, looks)
         tasks = ((*fixed, replicate, n_paths, choices) for replicate in range(replications))
         if workers == 1:
             local = pd.DataFrame(map(_surveillance_audit_replicate, tasks))
@@ -961,18 +1073,21 @@ def run_surveillance_null_audits(data_dir: Path, output_dir: Path, *, replicatio
         summaries.append(dict(
             series=replay.name, replications=replications, false_alarms=alarms,
             rate=alarms / replications, exact_ci_low=lower, exact_ci_high=upper,
-            planned_looks_evaluated=replications * len(replay.looks),
+            planned_looks_evaluated=replications * len(looks),
             **{column: int(local[column].sum()) for column in (
                 'unavailable_looks', 'fit_failures', 'phi_lower_looks', 'phi_upper_looks',
                 'risk_boundary_looks')},
         ))
         rows.append(local)
         settings[key] = dict(backend=choices, reference_risk=float(fit.pi),
-                             reference_shape=float(fit.phi), reference_days=end-start)
+                             reference_shape=float(fit.phi), reference_days=end-start,
+                             reference_last=frame.date.iloc[end - 1].date().isoformat(),
+                             planned_prefixes=looks)
     result = pd.DataFrame(summaries)
+    stem = 'brazil_common_calendar_audit' if brazil_common_calendar else 'null_audit'
     _write_surveillance_outputs(
-        data_dir, output_dir, 'null_audit_manifest.json',
-        {'null_audit_summary.csv': result, 'null_audit_replications.csv': pd.concat(rows, ignore_index=True)},
+        data_dir, output_dir, f'{stem}_manifest.json',
+        {f'{stem}_summary.csv': result, f'{stem}_replications.csv': pd.concat(rows, ignore_index=True)},
         dict(replications=replications, gaussian_paths_per_replication=n_paths, series=settings),
     )
     return result
@@ -1011,7 +1126,7 @@ def run_surveillance_benchmarks(data_dir: Path, output_dir: Path, *, n_paths: in
         reference_end = replay.index(replay.benchmark_reference_last) + 1
         delay = _primary_delay(replay)
         chart = OnlineBenchmarkCalibration(
-            delay, planned_looks=replay.looks, observation_start=observation,
+            delay, planned_looks=replay.benchmark_looks, observation_start=observation,
             reference_end=reference_end, lag_offset=replay.lag_offset, n_paths=n_paths,
             n_audit=n_audit, seed=seed, workers=workers, backend=backend,
         )
@@ -1020,7 +1135,7 @@ def run_surveillance_benchmarks(data_dir: Path, output_dir: Path, *, n_paths: in
         local = []
         # The chart receives cumulative counts through each current look.
         # Each new simulated day uses that day's available exposure.
-        for prefix in replay.looks:
+        for prefix in replay.benchmark_looks:
             for result in chart.advance(cases[:prefix], deaths[:prefix]):
                 local.append(dict(series=replay.name, series_key=key, **result,
                                   look_date=dates[prefix-1],
@@ -1037,11 +1152,12 @@ def run_surveillance_benchmarks(data_dir: Path, output_dir: Path, *, n_paths: in
                 cutoff_at_alarm=first.get('cutoff'),
                 reference_crossings=method_rows[-1]['reference_crossings'],
                 audit_crossings=method_rows[-1]['audit_crossings'], audit_replications=n_audit,
+                planned_looks=len(method_rows), first_look=method_rows[0]['look_date'],
                 reference_start=replay.outcome_start, reference_last=replay.benchmark_reference_last,
                 reference_risk=float(chart.reference_fit.pi),
                 reference_shape=float(chart.reference_fit.phi),
             ))
-        metadata[key] = dict(seed=seed, planned_prefixes=replay.looks, reference_end=reference_end,
+        metadata[key] = dict(seed=seed, planned_prefixes=replay.benchmark_looks, reference_end=reference_end,
                              observation_start=observation, delay=delay.tolist())
     result = pd.DataFrame(summaries)
     _write_surveillance_outputs(
@@ -1232,64 +1348,73 @@ def _plot_covid_surveillance(data_dir, output_dir, summary, trace):
         plt.close(fig)
 
 
-def _plot_brazil_surveillance(data_dir, output_dir, sensitivity):
+def _plot_brazil_surveillance(data_dir, output_dir, trace, sensitivity):
     replay = SURVEILLANCE_REPLAYS['brazil']
-    frame = _surveillance_frame(data_dir, replay)
-    frame = frame.loc[frame.date.ge(replay.outcome_start)]
-    colors = {'ejima': '#17659C', 'nishiura': '#008260', 'alarm': '#C24D00'}
-    style = {'font.family': 'DejaVu Sans', 'font.size': 9, 'axes.labelsize': 9,
-             'legend.fontsize': 8.3, 'pdf.fonttype': 42, 'ps.fonttype': 42,
+    daily = _surveillance_frame(data_dir, replay).set_index('date')
+    weekly = daily.loc[replay.outcome_start:replay.horizon].resample('W-SAT').sum()
+    primary = trace.loc[trace.series.eq(replay.name)]
+    alternative = sensitivity.loc[sensitivity.sensitivity_id.eq('brazil-nishiura-28-14')]
+    colors = {'onset': '#0072B2', 'death': '#A7421D', 'alternative': '#087A65'}
+    style = {'font.family': 'DejaVu Sans', 'font.size': 9.5, 'pdf.fonttype': 42,
              'axes.spines.top': False, 'axes.spines.right': False}
     with plt.rc_context(style):
-        fig, axes = plt.subplots(3, 1, sharex=True, figsize=(6.65, 5.25),
-                                 gridspec_kw={'height_ratios': [1, 1, 1.15]})
-        fig.subplots_adjust(left=.125, right=.985, bottom=.115, top=.915, hspace=.28)
-        for ax, field, label in zip(axes[:2], ('cases', 'deaths'), ('Cases by onset', 'Influenza deaths')):
-            ax.bar(frame.date, frame[field], width=.92, color='#788D9D', edgecolor='none', zorder=2)
-            ax.set_ylabel(label)
-            ax.set_ylim(bottom=0)
-            ax.yaxis.set_major_locator(MaxNLocator(nbins=4, integer=True))
-        evidence = axes[-1]
-        evidence.axhline(0, color='#525252', lw=.9, zorder=1)
-        first = None
-        for law, marker, linestyle, size, width in (
-            ('ejima', 'o', '-', 3.4, 1.6), ('nishiura', 's', '--', 3., 1.4),
+        fig, (onsets, deaths, evidence) = plt.subplots(
+            3, 1, sharex=True, figsize=(7.2, 6.1), layout='constrained',
+            gridspec_kw={'height_ratios': [1, 1, 1.5]},
+        )
+        fig.suptitle('Brazil seasonal A(H1N1)pdm09, 2018', x=.11, ha='left', fontweight='bold')
+        onsets.bar(weekly.index, weekly.cases, width=5, color=colors['onset'])
+        onsets.set_ylabel('Weekly cases\nby onset date')
+        deaths.bar(weekly.index, weekly.deaths, width=5, color=colors['death'])
+        deaths.set_ylabel('Weekly deaths\nby occurrence date')
+        alarms = {}
+        for local, label, linestyle, color in (
+            (primary, 'Ejima delay', '-', colors['onset']),
+            (alternative, 'Nishiura delay', '--', colors['alternative']),
         ):
-            local = sensitivity.loc[sensitivity.sensitivity_id.eq(f'brazil-{law}-28-14')]
-            evidence.plot(pd.to_datetime(local.look_date), local.evidence_margin, color=colors[law],
-                          marker=marker, linestyle=linestyle, ms=size, lw=width,
-                          label=f'Gamma, mean {BRAZIL_DELAY_LAWS[law][0]:.1f} d')
-            if law == 'ejima' and local.crossed.any():
-                first = local.loc[local.crossed].iloc[0]
-        if first is not None:
-            first_look = pd.Timestamp(first.look_date)
-            change = pd.Timestamp(first.estimated_change_date)
-            evidence.scatter([first_look], [first.evidence_margin], marker='^', s=59, c=colors['alarm'],
-                             edgecolor='white', linewidth=.6, zorder=9, clip_on=False)
-        evidence.set_ylabel('Statistic − boundary')
-        evidence.set_xlabel('Date in 2009, except the final look (2 January 2010)')
-        evidence.yaxis.set_major_locator(MaxNLocator(nbins=5))
-        evidence.xaxis.set_major_locator(mdates.MonthLocator())
+            margin = local.evidence_margin.where(np.isfinite(local.evidence_margin))
+            evidence.plot(pd.to_datetime(local.look_date), margin, label=label,
+                          linestyle=linestyle, color=color, linewidth=1.65)
+            if local.crossed.any():
+                row = local.loc[local.crossed].iloc[0]
+                alarms[label] = row
+                evidence.scatter(pd.Timestamp(row.look_date), row.evidence_margin, color=color, s=17, zorder=6)
+        evidence.axhline(0, color='#363636', linewidth=.9, linestyle=(0, (2, 2)))
+        evidence.set_ylabel('OCFR statistic\nminus boundary')
+
+        markers = [(pd.Timestamp(primary.look_date.iloc[0]), 'First look', ':', '#676767', 'left')]
+        primary_alarm = alarms.get('Ejima delay')
+        alternative_alarm = alarms.get('Nishiura delay')
+        shared_alarm = (primary_alarm is not None and alternative_alarm is not None
+                        and primary_alarm.look_date == alternative_alarm.look_date)
+        if primary_alarm is not None:
+            onset = pd.Timestamp(primary_alarm.estimated_change_date)
+            markers.append((onset, 'Selected onset*' if shared_alarm else 'Primary selected onset',
+                            '--', '#753FB1', 'right'))
+        if shared_alarm:
+            alarm = pd.Timestamp(primary_alarm.look_date)
+            markers.append((alarm, 'First alarm', '-', '#262626', 'left'))
+            alternative_onset = pd.Timestamp(alternative_alarm.estimated_change_date)
+            evidence.set_xlabel(f'*The sensitivity delay selected {alternative_onset.day} {alternative_onset:%b}. '
+                                f'Both delays first crossed on {alarm.day} {alarm:%b}.')
+        else:
+            for label, row in alarms.items():
+                markers.append((pd.Timestamp(row.look_date), label.split()[0] + ' first alarm',
+                                '-', '#262626', 'left'))
+        for day, label, linestyle, color, anchor in markers:
+            for ax in fig.axes:
+                ax.axvline(day, color=color, linewidth=.95, linestyle=linestyle, zorder=2)
+            onsets.annotate(f'{label}\n{day.day} {day:%b}', xy=(day, 1),
+                            xycoords=('data', 'axes fraction'),
+                            xytext=(-4 if anchor == 'right' else 4, 2), textcoords='offset points',
+                            ha=anchor, va='bottom', fontsize=8.8, color=color, annotation_clip=False)
+        evidence.legend(loc='upper left', ncols=2, framealpha=1, edgecolor='none')
+        evidence.xaxis.set_major_locator(mdates.MonthLocator(bymonth=[1, 3, 5, 7, 9, 11]))
         evidence.xaxis.set_major_formatter(mdates.DateFormatter('%b'))
-        evidence.set_xlim(frame.date.iloc[0] - pd.Timedelta(days=2), frame.date.iloc[-1] + pd.Timedelta(days=2))
-        for ax, panel in zip(axes, 'ABC'):
-            if first is not None:
-                ax.axvline(change, color=colors['ejima'], linestyle=(0, (4, 3)), lw=.95, alpha=.85, zorder=3)
-                ax.axvline(first_look, color=colors['alarm'], linestyle=(0, (2, 2)), lw=.95, zorder=3)
-            ax.grid(axis='y', color='#E2E7EA', lw=.55, zorder=0)
-            ax.text(-.09, 1.01, panel, transform=ax.transAxes, ha='left', va='bottom',
-                    fontsize=10, fontweight='bold')
-        handles, labels = evidence.get_legend_handles_labels()
-        if first is not None:
-            handles += [Line2D([0], [0], color=colors['ejima'], lw=.95, linestyle=(0, (4, 3))),
-                        Line2D([0], [0], color=colors['alarm'], marker='^', lw=.95,
-                               linestyle=(0, (2, 2)), markersize=5)]
-            labels += ['Selected onset date', 'First alarm']
-        fig.legend(handles, labels, loc='upper center', bbox_to_anchor=(.548, .985), ncol=4,
-                   handlelength=1.9, columnspacing=1.05, frameon=False)
-        for suffix in ('pdf', 'png'):
-            fig.savefig(output_dir / f'Fig8_brazil_influenza.{suffix}',
-                        dpi=240 if suffix == 'png' else None)
+        evidence.set_xlim(pd.Timestamp(replay.outcome_start) - pd.Timedelta(days=3),
+                          pd.Timestamp(replay.horizon) + pd.Timedelta(days=2))
+        fig.savefig(output_dir / 'Fig8_brazil_seasonal_2018.pdf')
+        fig.savefig(output_dir / 'Fig8_brazil_seasonal_2018.png', dpi=180)
         plt.close(fig)
 
 
@@ -1309,14 +1434,14 @@ def plot_surveillance(data_dir: Path, output_dir: Path) -> None:
     trace = pd.read_csv(output_dir / 'look_trace.csv', float_precision='round_trip')
     sensitivity = pd.read_csv(output_dir / 'sensitivity_trace.csv', float_precision='round_trip')
     _plot_covid_surveillance(data_dir, output_dir, summary, trace)
-    _plot_brazil_surveillance(data_dir, output_dir, sensitivity)
+    _plot_brazil_surveillance(data_dir, output_dir, trace, sensitivity)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     base = Path(__file__).parent
-    parser.add_argument('--stage', choices=('all', 'fetch', 'run', 'plot', 'benchmarks', 'audit'), default='all',
-                        help='all prepares missing inputs, runs OCFR and plots; benchmarks and audit are separate')
+    parser.add_argument('--stage', choices=('all', 'fetch', 'run', 'plot', 'benchmarks', 'audit', 'clinical-delay'),
+                        default='all', help='all prepares missing inputs, runs OCFR and plots')
     parser.add_argument('--application', choices=('manuscript', 'legacy-dengue'), default='manuscript',
                         help='use the manuscript four-series protocol or the older dengue example')
     parser.add_argument('--data', type=Path, default=base / 'data')
@@ -1334,7 +1459,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('--benchmark-audit-paths', type=int, default=10000)
     parser.add_argument('--null-replications', type=int, default=1000)
     parser.add_argument('--null-paths', type=int, default=10000)
+    parser.add_argument('--brazil-common-calendar', action='store_true',
+                        help='use the 39-look benchmark calendar for the Brazil audit only')
     args = parser.parse_args(argv)
+    if args.brazil_common_calendar and (args.stage != 'audit' or args.application != 'manuscript'):
+        parser.error('--brazil-common-calendar requires the manuscript audit stage')
     data_dir = args.data.resolve()
     default_output = 'real_data' if args.application == 'manuscript' else 'real_data_legacy_dengue'
     output_dir = (args.output or base / 'outputs' / default_output).resolve()
@@ -1373,13 +1502,18 @@ def main(argv: list[str] | None = None) -> int:
             result = run_surveillance_null_audits(
                 data_dir, output_dir, replications=args.null_replications,
                 n_paths=args.null_paths, workers=args.workers, backend=args.backend,
+                brazil_common_calendar=args.brazil_common_calendar,
             )
+            print(result.to_string(index=False))
+        if args.stage == 'clinical-delay':
+            result = run_brazil_clinical_delay(data_dir, output_dir, backend=args.backend or 'python',
+                                              boundary_policy=args.boundary_policy)
             print(result.to_string(index=False))
         return 0
     if args.require_manuscript_inputs:
         parser.error('input fingerprint verification uses the manuscript series')
-    if args.stage in {'benchmarks', 'audit'}:
-        parser.error('benchmarks and audit use the manuscript series')
+    if args.stage in {'benchmarks', 'audit', 'clinical-delay'}:
+        parser.error(f'{args.stage} uses the manuscript series')
     if args.stage in {'all', 'fetch'}:
         print(json.dumps(prepare_all(data_dir, refresh=args.refresh), indent=2))
     summary_path = output_dir / 'application_summary.csv'
