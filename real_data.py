@@ -22,7 +22,7 @@ import matplotlib.dates as mdates
 import numpy as np
 import pandas as pd
 from scipy.integrate import quad
-from scipy.stats import gamma
+from scipy.stats import fisher_exact, gamma
 
 from config import REAL_DATA, RealDataConfig, PostAlarmEstimationConfig
 from methods import (
@@ -318,28 +318,25 @@ SURVEILLANCE_REPLAYS = {
         ('united_kingdom', 'United Kingdom', 'United Kingdom of Great Britain and Northern Ireland'),
     ))
 }
-# The sparse January prefix motivates a weeks 1–13 reference for the benchmark
-# and case-conditional audit. The OCFR observed replay keeps its January start.
+# The Brazil reference is the fixed 97-day outcome period from 31 December
+# through 5 April; all methods share the following weekly calendar.
 SURVEILLANCE_REPLAYS['brazil'] = SurveillanceReplay(
-    'Brazil 2018 seasonal A(H1N1)pdm09', None, '2017-11-16', '2017-12-31', '2018-01-14',
-    '2018-01-27', '2018-12-29', '2018-03-31', 0, 2026112101, audit_reference_last='2018-03-31',
+    'Brazil 2024 A(H1N1)pdm09', None, '2023-11-16', '2023-12-31', '2024-01-14',
+    '2024-04-06', '2024-12-28', '2024-04-05', 0, 2026072605, audit_reference_last='2024-04-05',
 )
-BRAZIL_DAILY_FILE = 'brazil_2018_influenza_daily.csv'
+BRAZIL_DAILY_FILE = 'brazil_2024_influenza_daily.csv'
+# Pinned SIVEP-Gripe releases. The later 2025 archive verifies that no
+# in-window record is added by a subsequent annual publication.
 BRAZIL_SOURCES = {
-    'INFLUD17.csv': ('https://d26692udehoye.cloudfront.net/SRAG/2013-2018/INFLUD17.csv',
-                     'RES_FLUASU', 'DT_OBITO', '%d/%m/%Y'),
-    'INFLUD18.csv': ('https://d26692udehoye.cloudfront.net/SRAG/2013-2018/INFLUD18.csv',
-                     'RES_FLUASU', 'DT_OBITO', '%d/%m/%Y'),
-    'INFLUD19-23-03-2026.csv': (
-        'https://s3.sa-east-1.amazonaws.com/ckan.saude.gov.br/SRAG/2019/INFLUD19-23-03-2026.csv',
-        'PCR_FLUASU', 'DT_EVOLUCA', '%Y-%m-%d',
-    ),
+    2023: ('23-03-2026', '3adfca92884f4b213caaf81b1adf83e18416b19842c273a7e20c4ba9c9440070'),
+    2024: ('23-03-2026', '015135a33779ce28e2a0c43a83c06b7e76c11144ec47463a54687f8ca5e23f5a'),
+    2025: ('23-11-2026', 'f5fa3c826cb2591c53543d64048919cd5d9273984e51eade76b9cef958f3a3e6'),
 }
 BRAZIL_DELAY_LAWS = {'ejima': (9.5, 4.7**2), 'nishiura': (9., 39.7)}
 # These hashes are for the exact analyzed aggregates with LF line endings.
 MANUSCRIPT_INPUT_SHA256 = {
     'who_covid_processed.csv': '4f160c6817d4c15ce61ceb6831c1366277594c2db4d2852ec4be9977801ddd3e',
-    BRAZIL_DAILY_FILE: '38f1f97430880902637780b549b5300a9b9af0fcc43e110605b6791e82be7639',
+    BRAZIL_DAILY_FILE: 'eb0a436d0b6a20c22bc46faf589a692dd7dda62e417c2929d6d1caaf9279faf7',
 }
 
 
@@ -355,83 +352,113 @@ def _brazil_gamma_delay(mean: float, variance: float) -> np.ndarray:
 
 
 def prepare_brazil(data_dir: Path, *, refresh: bool = False) -> dict[str, Any]:
-    """Aggregate the 2018 season from the adjacent national SRAG releases."""
+    """Build the 2024 cohort from the three pinned official parquet releases."""
     replay = SURVEILLANCE_REPLAYS['brazil']
     dates = pd.date_range(replay.history_start, replay.horizon)
-    inputs, eligible = {}, []
-    for name, (source, subtype, outcome_date, date_format) in BRAZIL_SOURCES.items():
-        date_fields = ('DT_SIN_PRI', 'DT_NOTIFIC', outcome_date)
-        eligibility_fields = ['CLASSI_FIN', 'CRITERIO', 'HOSPITAL', subtype]
-        fields = (*date_fields, *eligibility_fields, 'EVOLUCAO', 'DT_NASC', 'CS_SEXO')
-        raw = _cached_download(source, data_dir / 'raw' / name, refresh=refresh)
-        records = pd.read_csv(io.BytesIO(raw), sep=';', encoding='latin1', usecols=fields, dtype=str)
-        for column in (*eligibility_fields, 'EVOLUCAO'):
-            records[column] = records[column].str.replace(r'\.0$', '', regex=True)
-        for column in date_fields:
-            records[column] = pd.to_datetime(records[column].str[:10], format=date_format,
-                                             errors='coerce')
-        if len(records) and records.DT_SIN_PRI.isna().all():
-            raise ValueError(f'{name}: could not parse any onset dates.')
-        # Code 1 in the four fields selects hospitalized, lab-confirmed A(H1N1)pdm09.
-        rows = records.loc[records[eligibility_fields].eq('1').all(axis=1)].rename(
-            columns={'DT_SIN_PRI': 'onset', 'DT_NOTIFIC': 'notification'})
-        rows['death'] = rows[outcome_date].where(rows.EVOLUCAO.eq('2'))
-        relevant = rows.onset.between(dates[0], dates[-1])
-        invalid = rows.death.lt(rows.onset)
-        selected = rows.loc[relevant & ~invalid, [
-            'onset', 'death', 'notification', 'EVOLUCAO', 'DT_NASC', 'CS_SEXO',
-        ]].assign(release=name)
-        eligible.append(selected)
-        inputs[name] = dict(url=source, sha256=_sha256(raw), source_rows=len(records),
-                            eligible_all=len(rows), eligible_records=len(selected),
-                            missing_onset=int(rows.onset.isna().sum()),
-                            negative_date_order_exclusions=int((relevant & invalid).sum()),
-                            prehistory_onsets=int(selected.onset.lt(replay.outcome_start).sum()),
-                            monitored_onsets=int(selected.onset.ge(replay.outcome_start).sum()),
-                            monitored_deaths=int(selected.death.between(replay.outcome_start, replay.horizon).sum()))
-
-    # Separate date axes retain deaths from earlier onset cohorts. Undated
-    # outcomes remain in the onset counts and contribute zero dated deaths.
-    cohort = pd.concat(eligible, ignore_index=True)
-    release_counts = cohort.groupby(['DT_NASC', 'CS_SEXO', 'onset'], dropna=False).release.nunique()
-    cross_release_matches = int(release_counts.gt(1).sum())
-    if cross_release_matches:
-        raise ValueError(f'Inspect {cross_release_matches} cross-release demographic and onset matches.')
-    counts = pd.DataFrame({
-        'date': dates,
+    fields = ['CLASSI_FIN', 'CRITERIO', 'HOSPITAL', 'PCR_FLUASU', 'DT_SIN_PRI',
+              'DT_EVOLUCA', 'EVOLUCAO', 'DT_NOTIFIC', 'DT_NASC', 'CS_SEXO',
+              'SG_UF', 'NU_IDADE_N', 'TP_IDADE']
+    eligibility = ['CLASSI_FIN', 'CRITERIO', 'HOSPITAL', 'PCR_FLUASU']
+    inputs, selected, historical = {}, [], []
+    for year, (snapshot, expected_hash) in BRAZIL_SOURCES.items():
+        name = f'INFLUD{year % 100:02d}-{snapshot}.parquet'
+        url = f'https://s3.sa-east-1.amazonaws.com/ckan.saude.gov.br/SRAG/{year}/{name}'
+        raw = _cached_download(url, data_dir / 'raw' / name, refresh=refresh)
+        actual_hash = _sha256(raw)
+        if actual_hash != expected_hash:
+            raise ValueError(f'{name}: pinned release hash changed ({actual_hash}).')
+        records = pd.read_parquet(io.BytesIO(raw), columns=fields)
+        for column in ('DT_SIN_PRI', 'DT_EVOLUCA', 'DT_NOTIFIC', 'DT_NASC'):
+            records[column] = pd.to_datetime(records[column], errors='coerce')
+        rows = records.loc[records[eligibility].astype(str).apply(
+            lambda column: column.str.strip().eq('1')).all(axis=1)].rename(columns={
+                'DT_SIN_PRI': 'onset', 'DT_NOTIFIC': 'notification', 'DT_NASC': 'birth_date',
+            }).copy()
+        rows['fatal'] = rows.EVOLUCAO.astype(str).str.strip().eq('2')
+        rows['death'] = rows.DT_EVOLUCA.where(rows.fatal)
+        relevant, invalid = rows.onset.between(dates[0], dates[-1]), rows.death.lt(rows.onset)
+        keep = ['onset', 'death', 'notification', 'fatal', 'EVOLUCAO', 'birth_date', 'CS_SEXO', 'SG_UF',
+                'NU_IDADE_N', 'TP_IDADE']
+        selected.append(rows.loc[relevant & ~invalid, keep].assign(release=year))
+        if year == 2023:
+            historical.append(rows.loc[~invalid, keep])
+        inputs[str(year)] = dict(url=url, sha256=actual_hash, source_rows=len(records),
+            eligible_all=len(rows), eligible_records=int((relevant & ~invalid).sum()),
+            negative_date_order_exclusions=int((relevant & invalid).sum()))
+    cohort = pd.concat(selected, ignore_index=True)
+    duplicates = int(cohort.groupby(['birth_date', 'CS_SEXO', 'onset'], dropna=False).release.nunique().gt(1).sum())
+    if duplicates:
+        raise ValueError(f'Inspect {duplicates} cross-release demographic and onset matches.')
+    counts = pd.DataFrame({'date': dates,
         'cases': cohort.onset.value_counts().reindex(dates, fill_value=0).to_numpy(),
-        'deaths': cohort.death.value_counts().reindex(dates, fill_value=0).to_numpy(),
-    })
-    monitored = cohort.loc[cohort.onset.ge(replay.outcome_start)]
-    output = data_dir / 'processed' / BRAZIL_DAILY_FILE
-    output.parent.mkdir(parents=True, exist_ok=True)
+        'deaths': cohort.death.value_counts().reindex(dates, fill_value=0).to_numpy()})
+    processed = data_dir / 'processed'
+    processed.mkdir(parents=True, exist_ok=True)
+    output = processed / BRAZIL_DAILY_FILE
     counts.to_csv(output, index=False, date_format='%Y-%m-%d', lineterminator='\n')
-    notification_at_planned_looks = {}
+    monitored = cohort.loc[cohort.onset.ge(replay.outcome_start)]
+    notifications = {}
     for prefix in replay.looks:
-        day = dates[prefix - 1]
-        through_look = monitored.loc[monitored.onset.le(day)]
-        notification_at_planned_looks[day.date().isoformat()] = {
-            'archived_onsets': len(through_look),
-            'notified_after_look': int(through_look.notification.gt(day).sum()),
-            'missing_notification_date': int(through_look.notification.isna().sum()),
-        }
-    delay = (monitored.death - monitored.onset).dt.days.dropna()
-    return {
-        'inputs': inputs, 'processed_file': output.name, 'rows': len(counts),
-        'negative_date_order_exclusions': sum(x['negative_date_order_exclusions'] for x in inputs.values()),
-        'cross_release_fingerprint_matches': cross_release_matches,
-        'deaths_without_date': int((cohort.EVOLUCAO.eq('2') & cohort.death.isna()).sum()),
-        'deaths_after_horizon': int(cohort.death.gt(replay.horizon).sum()),
-        'prehistory_cases': int(counts.iloc[:replay.index(replay.outcome_start)].cases.sum()),
-        'monitored_cohort_cases': len(monitored),
-        'monitored_deaths': int(counts.iloc[replay.index(replay.outcome_start):].deaths.sum()),
-        'outcomes_for_monitored_cohorts': monitored.EVOLUCAO.fillna('missing').value_counts().to_dict(),
-        'median_observed_delay_days': float(delay.median()) if len(delay) else None,
-        'clinical_delay_moments': dict(dated_deaths=len(delay),
-                                       mean_days=float(delay.mean()) if len(delay) else None,
-                                       variance_days_squared=float(delay.var(ddof=1)) if len(delay) > 1 else None),
-        'notification_at_planned_looks': notification_at_planned_looks,
+        day, through = dates[prefix - 1], monitored.loc[monitored.onset.le(dates[prefix - 1])]
+        notifications[day.date().isoformat()] = dict(archived_onsets=len(through),
+            notified_after_look=int(through.notification.gt(day).sum()),
+            missing_notification_date=int(through.notification.isna().sum()))
+    historic = pd.concat(historical, ignore_index=True)
+    lag = (historic.loc[historic.onset.between('2023-01-01', replay.history_start), 'death']
+           - historic.loc[historic.onset.between('2023-01-01', replay.history_start), 'onset']).dt.days
+    lag_counts = lag.loc[lag.between(0, 45)].astype(int).value_counts().reindex(range(46), fill_value=0).sort_index()
+    probabilities = lag_counts / lag_counts.sum()
+    pd.DataFrame({'day': np.arange(46), 'fatal_records': lag_counts.to_numpy(),
+                  'probability': probabilities.to_numpy()}).to_csv(processed / 'brazil_2023_empirical_delay.csv', index=False)
+    contexts = []
+    for split, alarm, law in (('2024-05-01', '2024-06-29', 'ejima'),
+                              ('2024-05-03', '2024-06-22', 'nishiura'),
+                              ('2024-06-04', '2024-07-06', '2023_empirical')):
+        frame = cohort.loc[cohort.onset.between(replay.outcome_start, alarm)].copy()
+        frame['cohort'] = np.where(frame.onset.ge(split), 'after', 'before')
+        frame['fatal45'] = frame.death.le(frame.onset + pd.Timedelta(days=45))
+        for side, group in frame.groupby('cohort', sort=True):
+            age = pd.to_numeric(group.NU_IDADE_N, errors='coerce')
+            known = group.TP_IDADE.astype(str).isin(['1', '2', '3']) & age.notna()
+            contexts.append(dict(delay=law, split=split, alarm=alarm, cohort=side, n=len(group),
+                fatal45=int(group.fatal45.sum()), n_age_known=int(known.sum()),
+                n_age65plus=int((group.TP_IDADE.astype(str).eq('3') & age.ge(65)).sum()),
+                south=int(group.SG_UF.isin(['PR', 'SC', 'RS']).sum()),
+                southeast=int(group.SG_UF.isin(['ES', 'MG', 'RJ', 'SP']).sum()),
+                notified_after_alarm=int(group.notification.gt(alarm).sum())))
+    pd.DataFrame(contexts).to_csv(processed / 'brazil_2024_cohort_context.csv', index=False)
+    primary = cohort.loc[cohort.onset.between(replay.outcome_start, '2024-06-29')].copy()
+    primary['after'] = primary.onset.ge('2024-05-01')
+    age = pd.to_numeric(primary.NU_IDADE_N, errors='coerce')
+    contrasts = {
+        'age_65_or_older': primary.TP_IDADE.astype(str).eq('3') & age.ge(65),
+        'south_residence': primary.SG_UF.isin(['PR', 'SC', 'RS']),
+        'documented_death_within_45_days': primary.death.le(primary.onset + pd.Timedelta(days=45)),
     }
+    comparisons = []
+    for outcome, events in contrasts.items():
+        before = events.loc[~primary.after]
+        after = events.loc[primary.after]
+        odds_ratio, p_value = fisher_exact([[int(before.sum()), int((~before).sum())],
+                                            [int(after.sum()), int((~after).sum())]], alternative='two-sided')
+        comparisons.append(dict(outcome=outcome, before_events=int(before.sum()), before_total=len(before),
+            after_events=int(after.sum()), after_total=len(after), odds_ratio=float(odds_ratio),
+            fisher_exact_two_sided_p=float(p_value), adjustment='unadjusted'))
+    pd.DataFrame(comparisons).to_csv(processed / 'brazil_2024_cohort_comparisons.csv', index=False)
+    delay = (monitored.death - monitored.onset).dt.days.dropna()
+    return dict(inputs=inputs, processed_file=output.name, rows=len(counts),
+        negative_date_order_exclusions=sum(x['negative_date_order_exclusions'] for x in inputs.values()),
+        cross_release_fingerprint_matches=duplicates, deaths_without_date=int((cohort.fatal & cohort.death.isna()).sum()),
+        deaths_after_horizon=int(cohort.death.gt(replay.horizon).sum()),
+        prehistory_cases=int(counts.iloc[:replay.index(replay.outcome_start)].cases.sum()),
+        monitored_cohort_cases=len(monitored), monitored_deaths=int(counts.iloc[replay.index(replay.outcome_start):].deaths.sum()),
+        outcomes_for_monitored_cohorts=monitored.EVOLUCAO.astype(str).str.strip().replace(
+            {'nan': 'missing', 'None': 'missing', '<NA>': 'missing'}).value_counts().to_dict(),
+        median_observed_delay_days=float(delay.median()) if len(delay) else None,
+        historical_empirical_delay=dict(fatal_records=int(lag_counts.sum()),
+            mean_days=float(np.arange(46) @ probabilities.to_numpy()),
+            median_days=int(np.searchsorted(np.cumsum(lag_counts.to_numpy()), (lag_counts.sum() + 1) / 2))),
+        notification_at_planned_looks=notifications)
 
 
 def _manuscript_input_hash(path: Path) -> str:
@@ -816,7 +843,19 @@ def _primary_delay(replay):
     return gamma_delay_pmf(14., shape=4., maximum_lag=45) if replay.lag_offset else brazil_delay()
 
 
-def _sensitivity_replays(key, frame, replay, primary, backend, boundary_policy):
+def _empirical_brazil_delay(data_dir: Path) -> tuple[np.ndarray, pd.DataFrame]:
+    """Recover the exact empirical masses from integer fatal-record counts."""
+    path = data_dir / 'processed' / 'brazil_2023_empirical_delay.csv'
+    if not path.is_file():
+        raise FileNotFoundError('Run the fetch stage to prepare the 2023 empirical delay kernel.')
+    kernel = pd.read_csv(path)
+    if (not np.array_equal(kernel.day.to_numpy(), np.arange(46))
+            or (kernel.fatal_records < 0).any() or kernel.fatal_records.sum() <= 0):
+        raise ValueError('The 2023 empirical delay kernel is invalid.')
+    return kernel.fatal_records.to_numpy(float) / kernel.fatal_records.sum(), kernel
+
+
+def _sensitivity_replays(key, frame, replay, primary, backend, boundary_policy, data_dir):
     """Reuse the primary runs in the appendix grids and hold the Gaussian seed fixed."""
     summary_rows, trace_rows = [], []
 
@@ -837,27 +876,17 @@ def _sensitivity_replays(key, frame, replay, primary, backend, boundary_policy):
         trace_rows.append(trace.assign(sensitivity_id=label))
 
     if key == 'brazil':
-        observation_start = replay.index(replay.outcome_start)
-        # All calendars end on the same date. An unavailable earlier look
-        # still consumes its planned index in the first-crossing rule.
-        for warmup, grids in ((14, (7,)), (21, (7, 14)), (28, (0, 7, 14))):
-            for grid in grids:
-                candidate = observation_start + grid
-                for law, (mean, variance) in BRAZIL_DELAY_LAWS.items():
-                    label = f'brazil-{law}-{warmup}-{grid}'
-                    result = primary if (warmup, grid, law) == (28, 14, 'ejima') else _ocfr_replay(
-                        frame, replay, brazil_delay(law), backend, boundary_policy,
-                        first_look=observation_start + warmup, candidate_start=candidate,
-                    )
-                    retain(label, result, law=law, mean_delay=mean, shape=mean**2 / variance,
-                           first_candidate=frame.date.iloc[candidate].date().isoformat())
-        # Compare alarm timing on the calendar available to the fixed-reference
-        # charts while retaining OCFR's original likelihood and candidate grid.
+        # All delay laws use the sole declared candidate and look calendar.
         for law, (mean, variance) in BRAZIL_DELAY_LAWS.items():
-            result = _ocfr_replay(frame, replay, brazil_delay(law), backend, boundary_policy,
-                                  first_look=replay.benchmark_looks[0])
-            retain(f'brazil-{law}-common-calendar', result, law=law, mean_delay=mean,
+            result = primary if law == 'ejima' else _ocfr_replay(
+                frame, replay, brazil_delay(law), backend, boundary_policy)
+            retain(f'brazil-{law}', result, law=law, mean_delay=mean,
                    shape=mean**2 / variance, first_candidate=replay.first_candidate)
+        delay, empirical = _empirical_brazil_delay(data_dir)
+        result = _ocfr_replay(frame, replay, delay, backend, boundary_policy)
+        retain('brazil-2023-empirical', result, law='2023 empirical',
+               mean_delay=float(empirical.day.to_numpy() @ delay), shape=np.nan,
+               first_candidate=replay.first_candidate)
     else:
         specs = [(float(mean), 4., replay.first_candidate) for mean in (11, 13, 14, 15, 17)]
         if key == 'south_korea':
@@ -896,7 +925,7 @@ def run_surveillance(data_dir: Path, output_dir: Path, *, backend: str = 'python
         residual_summaries.append(residual_summary)
         residuals.append(residual_frame)
         grids_for_series, traces_for_series = _sensitivity_replays(
-            key, frame, replay, (summary, trace), backend, boundary_policy,
+            key, frame, replay, (summary, trace), backend, boundary_policy, data_dir,
         )
         grids.extend(grids_for_series)
         grid_traces.extend(traces_for_series)
@@ -927,7 +956,7 @@ def run_surveillance(data_dir: Path, output_dir: Path, *, backend: str = 'python
 
 def run_brazil_clinical_delay(data_dir: Path, output_dir: Path, *, backend: str = 'python',
                              boundary_policy: str = GAUSSIAN_SPENDING_POLICY) -> pd.DataFrame:
-    """Replay an exploratory Gamma law fitted to finalized seasonal death dates."""
+    """Replay the prespecified empirical onset-to-death kernel from 2023."""
     provenance_path = data_dir / 'processed' / 'surveillance_provenance.json'
     if not provenance_path.is_file():
         raise FileNotFoundError('Run the fetch stage to prepare the aggregate clinical delay moments.')
@@ -935,21 +964,15 @@ def run_brazil_clinical_delay(data_dir: Path, output_dir: Path, *, backend: str 
     if source['analyzed_sha256'][BRAZIL_DAILY_FILE] != _surveillance_input_hashes(data_dir)[BRAZIL_DAILY_FILE]:
         raise ValueError('The seasonal counts changed after aggregation. Run the fetch stage again.')
     brazil = source['brazil']
-    moments = brazil.get('clinical_delay_moments')
-    if moments is None:
-        raise ValueError('Run the fetch stage to prepare the aggregate clinical delay moments.')
-    mean, variance = moments.get('mean_days'), moments.get('variance_days_squared')
-    if (mean is None or variance is None or not np.isfinite([mean, variance]).all()
-            or min(mean, variance) <= 0):
-        raise ValueError('The exploratory Gamma law requires finite positive mean and variance from dated deaths.')
+    delay, kernel = _empirical_brazil_delay(data_dir)
     replay = SURVEILLANCE_REPLAYS['brazil']
     frame = _surveillance_frame(data_dir, replay)
-    delay = _brazil_gamma_delay(mean, variance)
     record, trace = _ocfr_replay(frame, replay, delay, backend, boundary_policy)
     settings = dict(
-        scope='exploratory delay estimated from finalized seasonal records', moments=moments,
+        scope='2023 empirical 0--45-day onset-to-death sensitivity',
+        historical_delay=brazil['historical_empirical_delay'],
         raw_sha256={name: item['sha256'] for name, item in brazil['inputs'].items()},
-        gamma_shape=mean**2 / variance, gamma_scale=variance / mean, delay=delay.tolist(),
+        delay=delay.tolist(),
         replay=record.pop('provenance'),
     )
     result = pd.DataFrame([record])
@@ -1005,18 +1028,25 @@ def _surveillance_residuals(frame, replay, delay):
 
 
 def _surveillance_audit_replicate(task):
-    key, replay, delay, cases, mean, phi, start, looks, replicate, paths, backend = task
+    key, replay, delay, cases, mean, phi, start, looks, observed_deaths, replicate, paths, backend, cutoffs, reference_end = task
     # Splitting each replay's stream separates the case-conditional NB draws from the
     # Gaussian bank, and the full bank is shared over looks within a replicate.
     if key == 'brazil':
-        # The primary and common-calendar audits have disjoint simulation banks.
-        root_seed = 2026112118 if looks == replay.benchmark_looks else 2026112117
-        seed = np.random.SeedSequence([root_seed, 0, replicate])
+        seed = np.random.SeedSequence([2026112826, replicate])
     else:
         digest = hashlib.sha256(f'2026111621|{replay.name}|{replicate}'.encode()).digest()
         seed = np.random.SeedSequence(int.from_bytes(digest[:8], 'little'))
     death_seed, bank_seed = seed.spawn(2)
-    deaths = np.random.default_rng(death_seed).negative_binomial(phi, phi / (phi + mean))
+    rng = np.random.default_rng(death_seed)
+    if key == 'brazil':
+        # Draw only the post-reference vector: drawing the full calendar then
+        # discarding its reference prefix changes the deterministic RNG stream.
+        deaths = np.asarray(observed_deaths, dtype=float).copy()
+        post_mean = mean[reference_end:]
+        deaths[reference_end:] = (rng.poisson(post_mean) if phi >= 1e7 else
+                                  rng.negative_binomial(phi, phi / (phi + post_mean)))
+    else:
+        deaths = rng.poisson(mean) if phi >= 1e7 else rng.negative_binomial(phi, phi / (phi + mean))
     bank = np.random.default_rng(bank_seed).standard_normal((paths, len(cases)))
     boundary = GaussianSpendingBoundary(paths, len(looks), REAL_DATA.alpha)
     row = dict(series=replay.name, replicate=replicate, first_alarm_look=None,
@@ -1042,53 +1072,84 @@ def _surveillance_audit_replicate(task):
         if row['first_alarm_look'] is None and available and scan.statistic > step.boundary:
             row.update(first_alarm_look=number, first_alarm_prefix=prefix,
                        first_alarm_tau=int(scan.tau_hat))
+    if cutoffs is not None:
+        sd = np.sqrt(nb_variance(np.maximum(mean, MU_FLOOR), phi))
+        score, _, _ = _surveillance_traces_from_baseline(
+            deaths, mean, (deaths - mean) / sd, phi, reference_end, looks, .5, backend)
+        row['ocfr_alarm'] = row['first_alarm_look'] is not None
+        row['nbglr_alarm'] = bool((score[:, 0] > cutoffs['NB-GLR']).any())
+        row['cusum_alarm'] = bool((score[:, 1] > cutoffs['Page CUSUM']).any())
     return row
 
 
-def run_surveillance_null_audits(data_dir: Path, output_dir: Path, *, replications: int = 1000,
+def run_surveillance_null_audits(data_dir: Path, output_dir: Path, *, replications: int | None = None,
                                  n_paths: int = 10000, workers: int = 1,
                                  backend: str | None = None,
-                                 brazil_common_calendar: bool = False) -> pd.DataFrame:
+                                 benchmark_paths: int = 10000) -> pd.DataFrame:
     """Generate independent constant-risk audits conditional on observed case paths."""
-    if min(replications, n_paths, workers) < 1:
+    if min(n_paths, workers) < 1 or (replications is not None and replications < 1):
         raise ValueError('Replication, path and worker counts must be positive.')
     rows, summaries, settings = [], [], {}
-    replays = ({'brazil': SURVEILLANCE_REPLAYS['brazil']} if brazil_common_calendar
-               else SURVEILLANCE_REPLAYS)
+    replays = SURVEILLANCE_REPLAYS
     for key, replay in replays.items():
+        n_replications = replications if replications is not None else (2000 if key == 'brazil' else 1000)
         frame = _surveillance_frame(data_dir, replay)
         delay = _primary_delay(replay)
         fit, mean, start, end = _audit_reference(frame, replay, delay)
         choices = backend or ('c' if key == 'brazil' else 'python')
-        looks = replay.benchmark_looks if brazil_common_calendar else replay.looks
-        fixed = (key, replay, delay, frame.cases.to_numpy(float), mean, fit.phi, start, looks)
-        tasks = ((*fixed, replicate, n_paths, choices) for replicate in range(replications))
+        looks = replay.looks
+        cutoffs, reference_end = None, None
+        if key == 'brazil':
+            chart = OnlineBenchmarkCalibration(delay, planned_looks=looks, observation_start=start,
+                reference_end=end, lag_offset=replay.lag_offset, n_paths=benchmark_paths, n_audit=0,
+                seed=2026112825, workers=1, backend=choices)
+            trained = [item for prefix in looks for item in chart.advance(
+                frame.cases.to_numpy()[:prefix], frame.deaths.to_numpy()[:prefix])]
+            cutoffs = {method: np.array([item['cutoff'] for item in trained if item['method'] == method])
+                       for method in chart.methods}
+            reference_end = end
+        fixed = (key, replay, delay, frame.cases.to_numpy(float), mean, fit.phi, start, looks,
+                 frame.deaths.to_numpy(float))
+        tasks = ((*fixed, replicate, n_paths, choices, cutoffs, reference_end) for replicate in range(n_replications))
         if workers == 1:
             local = pd.DataFrame(map(_surveillance_audit_replicate, tasks))
         else:
             with ProcessPoolExecutor(max_workers=workers) as pool:
                 local = pd.DataFrame(pool.map(_surveillance_audit_replicate, tasks, chunksize=4))
         alarms = int(local.first_alarm_look.notna().sum())
-        lower, upper = binomial_interval(alarms, replications)
-        summaries.append(dict(
-            series=replay.name, replications=replications, false_alarms=alarms,
-            rate=alarms / replications, exact_ci_low=lower, exact_ci_high=upper,
-            planned_looks_evaluated=replications * len(looks),
+        lower, upper = binomial_interval(alarms, n_replications)
+        summary = dict(
+            series=replay.name, replications=n_replications, false_alarms=alarms,
+            rate=alarms / n_replications, exact_ci_low=lower, exact_ci_high=upper,
+            planned_looks_evaluated=n_replications * len(looks),
             **{column: int(local[column].sum()) for column in (
                 'unavailable_looks', 'fit_failures', 'phi_lower_looks', 'phi_upper_looks',
-                'risk_boundary_looks')},
-        ))
+                'risk_boundary_looks')})
+        if key == 'brazil':
+            for column, label in (('ocfr_alarm', 'OCFR'), ('nbglr_alarm', 'NB-GLR'), ('cusum_alarm', 'Page CUSUM')):
+                events = local[column].to_numpy(bool)
+                count = int(events.sum())
+                lo, hi = binomial_interval(count, n_replications)
+                paired = local.ocfr_alarm.to_numpy(int) - events.astype(int)
+                summaries.append(dict(series=replay.name, method=label, replications=n_replications,
+                    false_alarms=count, rate=count / n_replications, exact_ci_low=lo, exact_ci_high=hi,
+                    paired_ocfr_minus_method=float(paired.mean()),
+                    paired_mcse=float(paired.std(ddof=1) / np.sqrt(n_replications)),
+                    planned_looks_evaluated=n_replications * len(looks)))
+        else:
+            summaries.append(summary)
         rows.append(local)
         settings[key] = dict(backend=choices, reference_risk=float(fit.pi),
                              reference_shape=float(fit.phi), reference_days=end-start,
                              reference_last=frame.date.iloc[end - 1].date().isoformat(),
-                             planned_prefixes=looks)
+                             planned_prefixes=looks, benchmark_calibration_paths=benchmark_paths if key == 'brazil' else None)
     result = pd.DataFrame(summaries)
-    stem = 'brazil_common_calendar_audit' if brazil_common_calendar else 'null_audit'
+    stem = 'null_audit'
     _write_surveillance_outputs(
         data_dir, output_dir, f'{stem}_manifest.json',
         {f'{stem}_summary.csv': result, f'{stem}_replications.csv': pd.concat(rows, ignore_index=True)},
-        dict(replications=replications, gaussian_paths_per_replication=n_paths, series=settings),
+        dict(replications=replications, default_replications='1000 COVID; 2000 Brazil',
+             gaussian_paths_per_replication=n_paths, series=settings),
     )
     return result
 
@@ -1121,7 +1182,9 @@ def run_surveillance_benchmarks(data_dir: Path, output_dir: Path, *, n_paths: in
     rows, summaries, metadata = [], [], {}
     for index, (key, replay) in enumerate(SURVEILLANCE_REPLAYS.items()):
         frame = _surveillance_frame(data_dir, replay)
-        seed = 20261122 + index
+        # Brazil's comparator calibration is paired with its fitted-null
+        # audit protocol; the other historical replays retain their legacy streams.
+        seed = 2026112825 if key == 'brazil' else 20261122 + index
         observation = replay.index(replay.outcome_start)
         reference_end = replay.index(replay.benchmark_reference_last) + 1
         delay = _primary_delay(replay)
@@ -1348,13 +1411,12 @@ def _plot_covid_surveillance(data_dir, output_dir, summary, trace):
         plt.close(fig)
 
 
-def _plot_brazil_surveillance(data_dir, output_dir, trace, sensitivity):
+def _plot_brazil_surveillance(data_dir, output_dir, trace):
     replay = SURVEILLANCE_REPLAYS['brazil']
     daily = _surveillance_frame(data_dir, replay).set_index('date')
     weekly = daily.loc[replay.outcome_start:replay.horizon].resample('W-SAT').sum()
     primary = trace.loc[trace.series.eq(replay.name)]
-    alternative = sensitivity.loc[sensitivity.sensitivity_id.eq('brazil-nishiura-28-14')]
-    colors = {'onset': '#0072B2', 'death': '#A7421D', 'alternative': '#087A65'}
+    colors = {'onset': '#0072B2', 'death': '#A7421D'}
     style = {'font.family': 'DejaVu Sans', 'font.size': 9.5, 'pdf.fonttype': 42,
              'axes.spines.top': False, 'axes.spines.right': False}
     with plt.rc_context(style):
@@ -1362,45 +1424,27 @@ def _plot_brazil_surveillance(data_dir, output_dir, trace, sensitivity):
             3, 1, sharex=True, figsize=(7.2, 6.1), layout='constrained',
             gridspec_kw={'height_ratios': [1, 1, 1.5]},
         )
-        fig.suptitle('Brazil seasonal A(H1N1)pdm09, 2018', x=.11, ha='left', fontweight='bold')
+        fig.suptitle('Brazil A(H1N1)pdm09, 2024', x=.11, ha='left', fontweight='bold')
         onsets.bar(weekly.index, weekly.cases, width=5, color=colors['onset'])
         onsets.set_ylabel('Weekly cases\nby onset date')
         deaths.bar(weekly.index, weekly.deaths, width=5, color=colors['death'])
         deaths.set_ylabel('Weekly deaths\nby occurrence date')
-        alarms = {}
-        for local, label, linestyle, color in (
-            (primary, 'Ejima delay', '-', colors['onset']),
-            (alternative, 'Nishiura delay', '--', colors['alternative']),
-        ):
-            margin = local.evidence_margin.where(np.isfinite(local.evidence_margin))
-            evidence.plot(pd.to_datetime(local.look_date), margin, label=label,
-                          linestyle=linestyle, color=color, linewidth=1.65)
-            if local.crossed.any():
-                row = local.loc[local.crossed].iloc[0]
-                alarms[label] = row
-                evidence.scatter(pd.Timestamp(row.look_date), row.evidence_margin, color=color, s=17, zorder=6)
+        margin = primary.evidence_margin.where(np.isfinite(primary.evidence_margin))
+        evidence.plot(pd.to_datetime(primary.look_date), margin, label='Ejima delay',
+                      color=colors['onset'], linewidth=1.65)
+        primary_alarm = primary.loc[primary.crossed].head(1)
+        if len(primary_alarm):
+            primary_alarm = primary_alarm.iloc[0]
+            evidence.scatter(pd.Timestamp(primary_alarm.look_date), primary_alarm.evidence_margin,
+                             color=colors['onset'], s=17, zorder=6)
         evidence.axhline(0, color='#363636', linewidth=.9, linestyle=(0, (2, 2)))
         evidence.set_ylabel('OCFR statistic\nminus boundary')
 
         markers = [(pd.Timestamp(primary.look_date.iloc[0]), 'First look', ':', '#676767', 'left')]
-        primary_alarm = alarms.get('Ejima delay')
-        alternative_alarm = alarms.get('Nishiura delay')
-        shared_alarm = (primary_alarm is not None and alternative_alarm is not None
-                        and primary_alarm.look_date == alternative_alarm.look_date)
-        if primary_alarm is not None:
+        if len(primary.loc[primary.crossed]):
             onset = pd.Timestamp(primary_alarm.estimated_change_date)
-            markers.append((onset, 'Selected onset*' if shared_alarm else 'Primary selected onset',
-                            '--', '#753FB1', 'right'))
-        if shared_alarm:
-            alarm = pd.Timestamp(primary_alarm.look_date)
-            markers.append((alarm, 'First alarm', '-', '#262626', 'left'))
-            alternative_onset = pd.Timestamp(alternative_alarm.estimated_change_date)
-            evidence.set_xlabel(f'*The sensitivity delay selected {alternative_onset.day} {alternative_onset:%b}. '
-                                f'Both delays first crossed on {alarm.day} {alarm:%b}.')
-        else:
-            for label, row in alarms.items():
-                markers.append((pd.Timestamp(row.look_date), label.split()[0] + ' first alarm',
-                                '-', '#262626', 'left'))
+            markers.append((onset, 'Selected onset', '--', '#753FB1', 'right'))
+            markers.append((pd.Timestamp(primary_alarm.look_date), 'First alarm', '-', '#262626', 'left'))
         for day, label, linestyle, color, anchor in markers:
             for ax in fig.axes:
                 ax.axvline(day, color=color, linewidth=.95, linestyle=linestyle, zorder=2)
@@ -1413,13 +1457,76 @@ def _plot_brazil_surveillance(data_dir, output_dir, trace, sensitivity):
         evidence.xaxis.set_major_formatter(mdates.DateFormatter('%b'))
         evidence.set_xlim(pd.Timestamp(replay.outcome_start) - pd.Timedelta(days=3),
                           pd.Timestamp(replay.horizon) + pd.Timedelta(days=2))
-        fig.savefig(output_dir / 'Fig8_brazil_seasonal_2018.pdf')
-        fig.savefig(output_dir / 'Fig8_brazil_seasonal_2018.png', dpi=180)
+        fig.savefig(output_dir / 'Fig8_brazil_2024.pdf')
+        fig.savefig(output_dir / 'Fig8_brazil_2024.png', dpi=180)
+        plt.close(fig)
+
+
+def _plot_brazil_cohort_comparison(comparisons: pd.DataFrame, output_dir: Path) -> None:
+    """Display paired cohort percentages and exploratory Fisher exact results."""
+    labels = {
+        'age_65_or_older': r'Age $\geq$65 years',
+        'south_residence': 'South residence',
+        'documented_death_within_45_days': 'Documented death\nwithin 45 days',
+    }
+    ordered = comparisons.set_index('outcome').loc[list(labels)]
+    before = 100 * ordered.before_events / ordered.before_total
+    after = 100 * ordered.after_events / ordered.after_total
+    positions = np.arange(len(labels))[::-1]
+    before_color, after_color = '#5A5A5A', '#0F4D92'
+    style = {
+        'font.family': 'DejaVu Sans', 'font.size': 9.5, 'axes.labelsize': 9.5,
+        'axes.linewidth': 0.9, 'axes.spines.top': False, 'axes.spines.right': False,
+        'legend.frameon': False, 'pdf.fonttype': 42, 'ps.fonttype': 42,
+    }
+    with plt.rc_context(style):
+        fig, (ax, pcol) = plt.subplots(
+            1, 2, figsize=(8.2, 3.8), sharey=True, layout='constrained',
+            gridspec_kw={'width_ratios': [4.8, 1.45], 'wspace': 0.03},
+        )
+        fig.suptitle('Brazil 2024: cohort comparison around the selected onset date',
+                     x=0.03, ha='left', fontsize=11, fontweight='bold')
+        for y, left, right in zip(positions, before, after, strict=True):
+            ax.plot([left, right], [y, y], color='#A7A7A7', linewidth=1.4, zorder=1)
+        ax.scatter(before, positions, s=56, facecolor='white', edgecolor=before_color,
+                   linewidth=1.6, zorder=3, label=f'Before 1 May (n={ordered.before_total.iloc[0]:,})')
+        ax.scatter(after, positions, s=56, facecolor=after_color, edgecolor=after_color,
+                   linewidth=1.2, zorder=4, label=f'1 May–29 June (n={ordered.after_total.iloc[0]:,})')
+        for y, left, right in zip(positions, before, after, strict=True):
+            ax.annotate(f'{left:.1f}%', (left, y), xytext=(-7, 0), textcoords='offset points',
+                        ha='right', va='center', color=before_color, fontsize=9)
+            ax.annotate(f'{right:.1f}%', (right, y), xytext=(7, 0), textcoords='offset points',
+                        ha='left', va='center', color=after_color, fontsize=9, fontweight='bold')
+        ax.set_yticks(positions, list(labels.values()))
+        ax.set_xlim(0, 42)
+        ax.set_xticks([0, 10, 20, 30, 40], ['0%', '10%', '20%', '30%', '40%'])
+        ax.set_xlabel('Percentage of patients in onset period')
+        ax.grid(axis='x', color='#E2E2E2', linewidth=0.7, zorder=0)
+        ax.tick_params(axis='y', length=0, pad=7)
+        ax.legend(loc='lower left', bbox_to_anchor=(0, 1.005), ncols=2, columnspacing=1.5,
+                  handletextpad=0.5, borderaxespad=0, title='Onset period')
+
+        pcol.set_xlim(0, 1)
+        pcol.set_xticks([])
+        pcol.tick_params(axis='y', left=False, labelleft=False)
+        for spine in pcol.spines.values():
+            spine.set_visible(False)
+        pcol.axvline(0.04, color='#D0D0D0', linewidth=0.8)
+        pcol.text(0.13, 1.035, 'Exploratory two-sided\nFisher exact test',
+                  transform=pcol.transAxes, ha='left', va='bottom', fontsize=9, color='#3F3F3F')
+        for y, p_value in zip(positions, ordered.fisher_exact_two_sided_p, strict=True):
+            mantissa, exponent = f'{p_value:.4e}'.split('e')
+            label = rf'$p={mantissa}\times10^{{{int(exponent)}}}$'
+            pcol.text(0.13, y, label, ha='left', va='center', fontsize=9.2)
+
+        filename = output_dir / 'Fig9_brazil_cohort_comparison'
+        fig.savefig(filename.with_suffix('.pdf'), bbox_inches='tight', pad_inches=0.05)
+        fig.savefig(filename.with_suffix('.png'), dpi=300, bbox_inches='tight', pad_inches=0.05)
         plt.close(fig)
 
 
 def plot_surveillance(data_dir: Path, output_dir: Path) -> None:
-    """Reconstruct Figures 7 and 8 from the new run's aggregate rows and traces."""
+    """Reconstruct application figures from aggregate rows and traces."""
     manifest_path = output_dir / 'manifest.json'
     if not manifest_path.exists():
         raise FileNotFoundError(f'{manifest_path} is missing. Run the manuscript replay first.')
@@ -1432,9 +1539,11 @@ def plot_surveillance(data_dir: Path, output_dir: Path) -> None:
             raise ValueError(f'{name} changed after the replay. Run the manuscript replay again.')
     summary = pd.read_csv(output_dir / 'application_summary.csv').set_index('series')
     trace = pd.read_csv(output_dir / 'look_trace.csv', float_precision='round_trip')
-    sensitivity = pd.read_csv(output_dir / 'sensitivity_trace.csv', float_precision='round_trip')
     _plot_covid_surveillance(data_dir, output_dir, summary, trace)
-    _plot_brazil_surveillance(data_dir, output_dir, trace, sensitivity)
+    _plot_brazil_surveillance(data_dir, output_dir, trace)
+    comparisons = data_dir / 'processed' / 'brazil_2024_cohort_comparisons.csv'
+    if comparisons.exists():
+        _plot_brazil_cohort_comparison(pd.read_csv(comparisons), output_dir)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1457,18 +1566,16 @@ def main(argv: list[str] | None = None) -> int:
                         help='parallel workers for the online benchmarks or null audit')
     parser.add_argument('--benchmark-paths', type=int, default=10000)
     parser.add_argument('--benchmark-audit-paths', type=int, default=10000)
-    parser.add_argument('--null-replications', type=int, default=1000)
+    parser.add_argument('--null-replications', type=int,
+                        help='override audit episodes (defaults: 1,000 per COVID series; 2,000 Brazil)')
     parser.add_argument('--null-paths', type=int, default=10000)
-    parser.add_argument('--brazil-common-calendar', action='store_true',
-                        help='use the 39-look benchmark calendar for the Brazil audit only')
     args = parser.parse_args(argv)
-    if args.brazil_common_calendar and (args.stage != 'audit' or args.application != 'manuscript'):
-        parser.error('--brazil-common-calendar requires the manuscript audit stage')
     data_dir = args.data.resolve()
     default_output = 'real_data' if args.application == 'manuscript' else 'real_data_legacy_dengue'
     output_dir = (args.output or base / 'outputs' / default_output).resolve()
     if args.application == 'manuscript':
         cached = all((data_dir / 'processed' / name).is_file() for name in MANUSCRIPT_INPUT_SHA256)
+        cached = cached and (data_dir / 'processed' / 'brazil_2023_empirical_delay.csv').is_file()
         if args.stage == 'fetch' or (args.stage == 'all' and (args.refresh or not cached)):
             print(json.dumps(prepare_surveillance(data_dir, refresh=args.refresh), indent=2))
         try:
@@ -1502,7 +1609,7 @@ def main(argv: list[str] | None = None) -> int:
             result = run_surveillance_null_audits(
                 data_dir, output_dir, replications=args.null_replications,
                 n_paths=args.null_paths, workers=args.workers, backend=args.backend,
-                brazil_common_calendar=args.brazil_common_calendar,
+                benchmark_paths=args.benchmark_paths,
             )
             print(result.to_string(index=False))
         if args.stage == 'clinical-delay':

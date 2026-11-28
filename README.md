@@ -110,51 +110,57 @@ through their explicit names.
 ### Historical surveillance applications
 
 The current protocol replays WHO COVID-19 surveillance for Japan, South Korea,
-and the United Kingdom and the 2018 seasonal A(H1N1)pdm09 surveillance series
-from Brazil.
-The two data sources are the [WHO dashboard][who] and [Brazil's SINAN
-Influenza archive][sinan]. The WHO data use case and death report dates.
-The SINAN data use symptom-onset and death-occurrence dates for hospitalized,
-laboratory-confirmed cases. The replay indexes finalized or reconciled records
-by these dates.
+and the United Kingdom and a 2024 hospitalized A(H1N1)pdm09 cohort from Brazil.
+The two data sources are the [WHO dashboard][who] and Brazil's official
+[SIVEP-Gripe archive][sivep]. The WHO data use case and death report dates.
+The Brazil replay uses symptom-onset and death-occurrence dates for
+hospitalized, laboratory-confirmed A(H1N1)pdm09 records, from pinned 2023,
+2024, and 2025 parquet releases.
 
-Rebuild the daily counts from current public downloads, check them against
-the paper inputs, and generate Figs. 7–8:
+Rebuild the daily counts from public downloads, check them against the paper
+inputs, and generate Figs. 7–9:
 
 ```bash
 ocfr-real-data --stage all --data data/paper --output outputs/surveillance --require-manuscript-inputs
 ```
 
-The public releases reproduced the archived counts when verified for this
-revision. Data providers can revise their historical files. If the check
-fails, extract the manuscript's frozen aggregate input archive into a fresh
-data directory, with both CSV files under `processed/`, and rerun the
-command with that directory. The command uses these files offline. Use
-`--stage fetch` to generate the upstream provenance and record-flow counts
-separately. The two files required for an offline replay are
-`processed/who_covid_processed.csv` and
-`processed/brazil_2018_influenza_daily.csv`.
+Each Brazil download is verified against its pinned SHA-256 digest. Use
+`--stage fetch` to generate provenance, the daily series, the 2023 empirical
+delay kernel, and `brazil_2024_cohort_context.csv`; the latter contains the
+age, region, notification, and 45-day fatality numerators and denominators
+for the observed replay splits without releasing person-level records.
+`brazil_2024_cohort_comparisons.csv` gives the three primary-split
+(May 1/June 29) two-sided Fisher exact comparisons for age 65 or older,
+South residence, and documented 45-day death in Fig. 9. These unadjusted
+p-values are exploratory and treat the selected date as fixed.
+For an offline `--stage all` replay, retain `processed/who_covid_processed.csv`,
+`processed/brazil_2024_influenza_daily.csv`, and
+`processed/brazil_2023_empirical_delay.csv` together. Include
+`processed/brazil_2024_cohort_comparisons.csv` to reproduce Fig. 9.
 
 ```bash
 ocfr-real-data --stage benchmarks --data data/paper --output outputs/surveillance --workers 8 --require-manuscript-inputs
 ocfr-real-data --stage audit --data data/paper --output outputs/surveillance --workers 8 --require-manuscript-inputs
-ocfr-real-data --stage audit --brazil-common-calendar --data data/paper --output outputs/surveillance --workers 8 --require-manuscript-inputs
 ocfr-real-data --stage clinical-delay --data data/paper --output outputs/surveillance --require-manuscript-inputs
 ```
 
 The main replay writes the four OCFR series, delay and calendar
-sensitivity analyses, residual summaries, and Figures 7 and 8. The benchmark command
+sensitivity analyses, residual summaries, and Figs. 7–9. The benchmark command
 runs NB-GLR and Page CUSUM with look-specific calibration from each observed
 prefix, retaining its first-alarm dates and the independent null-path
-diagnostics. In Brazil, OCFR uses 49 weekly analyses starting 27 January.
-The benchmarks fit a fixed baseline over the first 13 epidemiological
-weeks and use 39 weekly analyses starting 7 April. The two audit commands
-run OCFR null audits conditional on the archived case series. The
-clinical-delay command constructs the longer exploratory Brazilian delay
-from dated fatal outcomes and downloads the raw SINAN releases when they are absent.
+diagnostics. In Brazil, all methods use the one weekly calendar beginning
+6 April, after a baseline through 5 April; candidates begin 14 January.
+The Brazil figure displays the default published Ejima delay only; the
+Nishiura and historical-2023 empirical replays remain in the sensitivity CSVs.
+The audit holds the case path and fitted baseline fixed, simulates paired
+null death paths, and reports OCFR, NB-GLR, Page CUSUM, and paired
+OCFR-minus-comparator differences. The clinical-delay command replays the
+empirical 0--45-day onset-to-death kernel estimated from 2023 records through
+16 November; it is a historical sensitivity, not a fitted 2024 delay.
 Defaults retain 10,000 paths for application
 boundaries, 10,000 training paths and 10,000 independent validation paths
-for benchmark cutoffs, and 1,000 replications per OCFR null audit.
+for benchmark cutoffs, and 1,000 null-audit replications per COVID series and
+2,000 for Brazil. Pass `--null-replications` to override either default.
 
 Risk ratios in the applications use nominal Wald intervals calculated with
 the selected change date and first alarm date held fixed. A later statistic
@@ -162,7 +168,7 @@ below its boundary leaves the earlier alarm in the trace. See the CLI help
 for backend choices, short-run counts and the earlier dengue example.
 
 [who]: https://data.who.int/dashboards/covid19/data
-[sinan]: https://dadosabertos.saude.gov.br/dataset/srag-2013-2018
+[sivep]: https://dadosabertos.saude.gov.br/dataset/srag-2019-a-2026
 
 ## Use the detector independently
 

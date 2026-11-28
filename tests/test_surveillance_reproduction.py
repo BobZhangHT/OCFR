@@ -15,50 +15,51 @@ from real_data import (
 )
 
 
-def test_srag_uses_subtype_and_separate_onset_and_death_dates(tmp_path):
-    raw = tmp_path / 'raw'
-    raw.mkdir()
-    columns = 'DT_SIN_PRI;DT_OBITO;DT_NOTIFIC;DT_NASC;CS_SEXO;CLASSI_FIN;CRITERIO;HOSPITAL;RES_FLUASU;EVOLUCAO\n'
-    (raw / 'INFLUD17.csv').write_text(
-        columns + '30/12/2017;02/01/2018;30/12/2017;01/01/1980;F;1;1;1;1;2\n',
-        encoding='latin1',
-    )
-    (raw / 'INFLUD18.csv').write_text(
-        columns
-        + '31/12/2017;;28/01/2018;;F;1;1;1;1;2\n'
-        + '02/01/2018;01/01/2018;02/01/2018;;F;1;1;1;1;2\n'
-        + '03/01/2018;03/01/2018;03/01/2018;;F;1;1;1;2;2\n'
-        + '04/01/2018;04/01/2018;04/01/2018;;F;1;1;0;1;2\n',
-        encoding='latin1',
-    )
-    (raw / 'INFLUD19-23-03-2026.csv').write_text(
-        columns.replace('RES_FLUASU', 'PCR_FLUASU').replace('DT_OBITO', 'DT_EVOLUCA')
-        + '2018-12-29;2018-12-29;2018-12-29;;M;1.0;1.0;1.0;1.0;3.0\n'
-        + '2018-12-30;2018-12-31;2018-12-30;;M;1.0;1.0;1.0;1.0;2.0\n',
-        encoding='latin1',
-    )
+def test_srag_uses_pinned_parquet_and_separate_onset_and_death_dates(tmp_path, monkeypatch):
+    columns = ['CLASSI_FIN', 'CRITERIO', 'HOSPITAL', 'PCR_FLUASU', 'DT_SIN_PRI',
+               'DT_EVOLUCA', 'EVOLUCAO', 'DT_NOTIFIC', 'DT_NASC', 'CS_SEXO',
+               'SG_UF', 'NU_IDADE_N', 'TP_IDADE']
+    def records(rows):
+        return pd.DataFrame(rows, columns=columns)
+    releases = {
+        b'23': records([['1', '1', '1', '1', '2023-06-01', '2023-06-11', '2', '2023-06-03',
+                          '1980-01-01', 'F', 'SP', 43, '3']]),
+        b'24': records([['1', '1', '1', '1', '2023-12-31', None, '2', '2024-05-28',
+                          '1980-01-01', 'F', 'SP', 43, '3'],
+                         ['1', '1', '1', '1', '2024-01-02', '2024-01-03', '2', '2024-01-02',
+                          '1980-01-01', 'F', 'SP', 43, '3']]),
+        b'25': records([['1', '1', '1', '1', '2024-12-28', '2024-12-29', '2', '2024-12-28',
+                          '1980-01-01', 'M', 'RS', 70, '3']]),
+    }
+    tokens = {2023: b'23', 2024: b'24', 2025: b'25'}
+    hashes = {year: real_data._sha256(token) for year, token in tokens.items()}
+    monkeypatch.setattr(real_data, 'BRAZIL_SOURCES', {year: ('test', digest) for year, digest in hashes.items()})
+    monkeypatch.setattr(real_data, '_cached_download', lambda url, path, refresh=False: tokens[int(url.split('/SRAG/')[1][:4])])
+    monkeypatch.setattr(real_data.pd, 'read_parquet', lambda source, columns: releases[source.read()])
     audit = prepare_brazil(tmp_path)
     frame = _surveillance_frame(tmp_path, SURVEILLANCE_REPLAYS['brazil']).set_index('date')
     assert len(frame) == 409
-    assert tuple(frame.loc['2018-01-02']) == (0, 1)
-    assert tuple(frame.loc['2018-12-29']) == (1, 0)
+    assert tuple(frame.loc['2024-01-02']) == (1, 0)
+    assert tuple(frame.loc['2024-01-03']) == (0, 1)
+    assert tuple(frame.loc['2024-12-28']) == (1, 0)
     assert frame.cases.sum() == 3
     assert frame.deaths.sum() == 1
-    assert audit['negative_date_order_exclusions'] == 1
+    assert audit['negative_date_order_exclusions'] == 0
     assert audit['deaths_without_date'] == 1
-    assert audit['notification_at_planned_looks']['2018-01-27']['notified_after_look'] == 1
-    assert audit['inputs']['INFLUD19-23-03-2026.csv']['eligible_records'] == 1
+    assert audit['notification_at_planned_looks']['2024-04-06']['notified_after_look'] == 1
+    assert audit['inputs']['2025']['eligible_records'] == 1
+    assert (tmp_path / 'processed' / 'brazil_2023_empirical_delay.csv').is_file()
 
 
 def test_manuscript_calendars_and_zero_lag_influenza():
     who = SURVEILLANCE_REPLAYS['japan']
     brazil = SURVEILLANCE_REPLAYS['brazil']
     assert who.looks == (*range(75, 244, 7), 245)
-    assert brazil.looks == tuple(range(73, 410, 7))
+    assert brazil.looks == tuple(range(143, 410, 7))
     assert who.benchmark_looks == who.looks
-    assert brazil.benchmark_looks == tuple(range(143, 410, 7))
+    assert brazil.benchmark_looks == brazil.looks
     assert real_data._audit_reference_end(who) == who.looks[0] - 1
-    assert real_data._audit_reference_end(brazil) == 136
+    assert real_data._audit_reference_end(brazil) == 142
     assert (who.index(who.first_candidate), brazil.index(brazil.first_candidate)) == (61, 59)
     for law in ('ejima', 'nishiura'):
         mass = brazil_delay(law)
@@ -98,6 +99,9 @@ def test_exact_cached_cli_replays_offline_and_rejects_changed_inputs(tmp_path, m
     processed.mkdir()
     for name in real_data.MANUSCRIPT_INPUT_SHA256:
         (processed / name).write_bytes(b'frozen counts\r\n')
+    pd.DataFrame({'day': np.arange(46), 'fatal_records': [1] * 46,
+                  'probability': [1 / 46] * 46}).to_csv(
+        processed / 'brazil_2023_empirical_delay.csv', index=False)
     monkeypatch.setattr(real_data, 'MANUSCRIPT_INPUT_SHA256',
                         real_data._surveillance_input_hashes(tmp_path))
 
