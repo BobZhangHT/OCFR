@@ -1,218 +1,94 @@
 # OCFR
 
-OCFR detects changes in delay-adjusted epidemic case-fatality risk. It fits a
-negative-binomial convolution model and scans possible cohort change dates.
-One Gaussian multiplier bank calibrates cumulative first-crossing boundaries
-across the planned analyses for the practical Section 2 procedure. The
-simulation comparison also applies an oracle calibration to the same OCFR
-scan and compares both calibrations with NB-GLR and Page CUSUM. The detector
-uses a supplied delay distribution that links each case cohort to later deaths.
+OCFR detects a persistent change in epidemic case-fatality risk from daily
+case and death counts. A negative-binomial model links earlier case cohorts
+to later deaths through a supplied delay distribution. At the first alarm,
+OCFR estimates the date separating the two case cohorts.
 
-The 22-look simulation design uses 1,999 Gaussian paths. Real applications
-and the portable online API use 10,000 paths to reduce variation from the
-realized numerical bank. Both use the same boundary construction.
+## Monitor your own data
 
-## Contents
-
-| File | Purpose |
-| --- | --- |
-| `config.py` | Data-generating scenarios, method settings, seeds and study plans. |
-| `methods.py` | Portable detectors, estimators, intervals, samplers and C bindings. |
-| `simulation.py` | Parallel experiments, atomic caches, resume and scoped reset. |
-| `analysis.py` | Simulation summaries, interval calibration and publication figures. |
-| `real_data.py` | Download, preprocessing, replay, benchmark calibration, null audits and figures for all surveillance series. |
-| `csrc/ocfr_kernels.c` | C acceleration and matched random sampling. |
-
-The repository contains code, tests and essential documentation. Downloaded
-data, results, figures, caches, compiled libraries and manuscripts are ignored.
-
-## Install
-
-Use Python 3.10 or newer, preferably in a virtual environment:
+Install from the repository root with Python 3.10 or later.
 
 ```bash
-python -m pip install -e ".[test]"
+git clone https://github.com/BobZhangHT/OCFR.git
+cd OCFR
+python -m pip install -e .
 ```
 
-C is the default backend. With GCC, Clang, MSVC or Zig available:
+Choose a monitoring horizon and analysis days before monitoring starts.
+Supply one row per day in calendar order, with columns `date,cases,deaths`,
+and choose a delay distribution that matches how the two counts are dated.
+The interface counts delays from one day onward. This example uses a 182-day
+horizon, weekly analyses starting on day 35, and Gamma delay probabilities
+for lags 1 to 45 days.
 
-```bash
-python -c "import methods; print(methods.build_native(force=True))"
-python -c "import methods; print(methods.assert_backend_parity())"
+```python
+from csv import DictReader
+from itertools import islice
+
+from methods import OnlineGaussianProcessScore, gamma_delay_pmf, make_sampler
+
+backend = "c"
+horizon = 182
+detector = OnlineGaussianProcessScore(
+    gamma_delay_pmf(14, shape=4, maximum_lag=45),
+    horizon=horizon,
+    planned_looks=tuple(range(35, horizon + 1, 7)),
+    alpha=0.05,
+    rng=make_sampler(2026111404, backend=backend),
+    backend=backend,
+)
+
+dates = []
+with open("daily_counts.csv", newline="", encoding="utf-8-sig") as stream:
+    for row in islice(DictReader(stream), horizon):
+        dates.append(row["date"])
+        result = detector.update(int(row["cases"]), int(row["deaths"]))
+        if result.alarm:
+            print("First alarm", dates[-1])
+            print("Estimated cohort change date", dates[result.estimated_change_day])
+            break
+    else:
+        print("No alarm on the supplied monitoring days")
 ```
 
-The Python implementation needs no compiler. Select it explicitly with
-`--backend python` when a C compiler or a loadable native library is unavailable.
-The v2 Python multiplier bank uses vectorized PCG32/Box--Muller generation;
-temporary arrays are bounded by chunks, and count draws retain the scalar
-reference stream. Tests check integer draws,
-stream progression and numerical agreement of the score and boundary paths.
+The C backend requires a supported compiler on first use. Set
+`backend = "python"` to run without a compiler. For live monitoring, call
+`detector.update` once per day as new counts arrive.
 
-## Reproduce the manuscript
-
-Run the simulation study and historical surveillance applications from a
-fresh checkout after installation. Use separate output directories for
-full studies and short workflow checks. The programs keep downloaded data,
-results, figures, and caches outside version control.
+## Reproduce the paper
 
 ### Simulation study
 
-```bash
-ocfr-simulate --stage paper --mode full --jobs 8 --output outputs/paper
-```
-
-This command trains the fixed thresholds, audits false alarms on independent
-null replications, compares detection and localization, runs the sensitivity
-and boundary studies, and evaluates post-alarm estimation. The paper's
-simulation figures and their tables are written under `outputs/paper`.
-Figure 1 uses illustrative values. Figures 2 through 6 and the simulation tables use the
-newly computed results.
-
-The study uses 10,000 null-training and 5,000 null-audit replications for each
-of three incidence families. Each of 41 reported evaluation conditions uses
-1,000 replications. Interval cutoffs are fitted separately from detection
-thresholds. Their validation uses 1,000 new replications for each of the 16
-reference alternatives. The workflow saves cell-level and replication-level
-evidence alongside each stage manifest.
-
-Practical OCFR uses data-prefix Gaussian boundaries. Oracle OCFR uses the
-same fitted scan and a fixed cutoff trained under the known null generator
-for each incidence family. The report-day NB-GLR and Page CUSUM benchmarks
-receive their own cutoffs from the same training design. First alarms on or
-after the true change contribute to detection probability. All requested
-replications stay in its denominator. Localization accuracy is summarized
-separately, and the study applies both estimators in Fig. 5 to the same
-first-alarm data and selected date.
-
-The paper command reproduces the recorded backend choices. Practical
-simulation scores and benchmark training use Python. Oracle cutoff training
-and the designated raw-score replays use the C kernels. The simulation uses
-1,999 shared Gaussian paths. Repeat the command with the same output
-directory to verify completed stages and resume. Use a fresh directory for
-an independent recomputation or after changing the code. The workload is
-suitable for multiple workers. `--jobs -1` uses all available CPUs.
-
-To check the command-line workflow with ten replications per condition, run
-the smaller protocol below. Its empirical thresholds can be infinite
-because ten training replications cannot resolve the 5% Monte Carlo rank.
+The full replication workflow requires the C backend.
 
 ```bash
-ocfr-simulate --stage calibration --mode demo --jobs 2 --output outputs/demo
-ocfr-simulate --stage audit --mode demo --jobs 2 --output outputs/demo
-ocfr-simulate --stage evaluation --mode demo --jobs 2 --output outputs/demo
-ocfr-analyze --protocol compact-v2 --input outputs/demo
+python simulation.py --stage paper --mode full --jobs 8 --output outputs/paper
 ```
 
-Use `ocfr-simulate --help` for running an individual stage, selecting scenarios,
-and resetting its scoped cache. The earlier study protocols remain accessible
-through their explicit names.
+The full workflow generates the simulation results, tables, and Figures 2 to 6.
+Run the same command again to resume from its saved stages.
 
-### Historical surveillance applications
+### Surveillance applications
 
-The current protocol replays WHO COVID-19 surveillance for Japan, South Korea,
-and the United Kingdom and a 2024 hospitalized A(H1N1)pdm09 cohort from Brazil.
-The two data sources are the [WHO dashboard][who] and Brazil's official
-[SIVEP-Gripe archive][sivep]. The WHO data use case and death report dates.
-The Brazil replay uses symptom-onset and death-occurrence dates for
-hospitalized, laboratory-confirmed A(H1N1)pdm09 records, from pinned 2023,
-2024, and 2025 parquet releases.
-
-Rebuild the daily counts from public downloads, check them against the paper
-inputs, and generate Figs. 7–9:
+The applications use [WHO COVID-19 data](https://data.who.int/dashboards/covid19/data)
+for Japan, South Korea, and the United Kingdom, and
+[SIVEP-Gripe records](https://dadosabertos.saude.gov.br/dataset/srag-2019-a-2026)
+for Brazilian influenza in 2024.
 
 ```bash
-ocfr-real-data --stage all --data data/paper --output outputs/surveillance --require-manuscript-inputs
+python real_data.py --stage all --data data/paper --output outputs/surveillance --require-manuscript-inputs
+python real_data.py --stage benchmarks --data data/paper --output outputs/surveillance --workers 8 --require-manuscript-inputs
+python real_data.py --stage audit --data data/paper --output outputs/surveillance --workers 8 --require-manuscript-inputs
 ```
 
-Each Brazil download is verified against its pinned SHA-256 digest. Use
-`--stage fetch` to generate provenance, the daily series, the 2023 empirical
-delay kernel, and `brazil_2024_cohort_context.csv`; the latter contains the
-age, region, notification, and 45-day fatality numerators and denominators
-for the observed replay splits without releasing person-level records.
-`brazil_2024_cohort_comparisons.csv` gives the three primary-split
-(May 1/June 29) two-sided Fisher exact comparisons for age 65 or older,
-South residence, and documented 45-day death in Fig. 9. These unadjusted
-p-values are exploratory and treat the selected date as fixed.
-For an offline `--stage all` replay, retain `processed/who_covid_processed.csv`,
-`processed/brazil_2024_influenza_daily.csv`, and
-`processed/brazil_2023_empirical_delay.csv` together. Include
-`processed/brazil_2024_cohort_comparisons.csv` to reproduce Fig. 9.
+The first command downloads the data, runs OCFR and the sensitivity analyses,
+and generates Figures 7 to 9. The next two reproduce the benchmark comparisons
+and fitted-null alarm rates. The input check compares the processed counts
+with the snapshots used in the paper.
 
-```bash
-ocfr-real-data --stage benchmarks --data data/paper --output outputs/surveillance --workers 8 --require-manuscript-inputs
-ocfr-real-data --stage audit --data data/paper --output outputs/surveillance --workers 8 --require-manuscript-inputs
-ocfr-real-data --stage clinical-delay --data data/paper --output outputs/surveillance --require-manuscript-inputs
-```
+## Contact
 
-The main replay writes the four OCFR series, delay and calendar
-sensitivity analyses, residual summaries, and Figs. 7–9. The benchmark command
-runs NB-GLR and Page CUSUM with look-specific calibration from each observed
-prefix, retaining its first-alarm dates and the independent null-path
-diagnostics. In Brazil, all methods use the one weekly calendar beginning
-6 April, after a baseline through 5 April; candidates begin 14 January.
-The Brazil figure displays the default published Ejima delay only; the
-Nishiura and historical-2023 empirical replays remain in the sensitivity CSVs.
-The audit holds the case path and fitted baseline fixed, simulates paired
-null death paths, and reports OCFR, NB-GLR, Page CUSUM, and paired
-OCFR-minus-comparator differences. The clinical-delay command replays the
-empirical 0--45-day onset-to-death kernel estimated from 2023 records through
-16 November; it is a historical sensitivity, not a fitted 2024 delay.
-Defaults retain 10,000 paths for application
-boundaries, 10,000 training paths and 10,000 independent validation paths
-for benchmark cutoffs, and 1,000 null-audit replications per COVID series and
-2,000 for Brazil. Pass `--null-replications` to override either default.
-
-Risk ratios in the applications use nominal Wald intervals calculated with
-the selected change date and first alarm date held fixed. A later statistic
-below its boundary leaves the earlier alarm in the trace. See the CLI help
-for backend choices, short-run counts and the earlier dengue example.
-
-[who]: https://data.who.int/dashboards/covid19/data
-[sivep]: https://dadosabertos.saude.gov.br/dataset/srag-2019-a-2026
-
-## Use the detector independently
-
-Copy `methods.py` and `csrc/` into another project, or import the installed
-module. Supply a delay probability vector and a declared look schedule:
-
-```python
-from methods import OnlineGaussianProcessScore, gamma_delay_pmf, make_sampler
-
-detector = OnlineGaussianProcessScore(
-    gamma_delay_pmf(14, shape=4, maximum_lag=45),
-    horizon=182, planned_looks=tuple(range(35, 183, 7)),
-    n_multiplier=10_000, rng=make_sampler(2026111404, backend="c"),
-    backend="c",
-)
-for cases_today, deaths_today in observations:
-    result = detector.update(cases_today, deaths_today)
-    if result.alarm:
-        break
-```
-
-The detector stops at its first strict boundary crossing. Its numerical
-reference-crossing fraction is a diagnostic of the calibration bank; actual
-episode error is evaluated with independent null episodes.
-
-## Tests
-
-```bash
-python -m pytest
-```
-
-Tests cover boundary ranks and support removal, prefix-only decisions,
-matched C/Python calculations, sampler state, protocol contracts, cache
-integrity and deterministic parallel/resume behavior. Native tests require
-a working C backend and can build one; do not run those tests on a host that
-blocks native compilation or loading. For a portable-only check without a
-native build, run:
-
-```bash
-python -m pytest --ignore=tests/test_compact_native_multiplier.py --ignore=tests/test_compact_surveillance_native.py -k "not numerically_matched and not zero_lag_weekly_exposure_has_native_parity and not sensitivity_generator_native_reference_parity"
-```
-
-This deliberately deselects native parity checks and does not validate the C
-backend. CI retains the separate native build and parity check on supported
-runners. See `--help` for each of the three installed command entry points.
-
-Project: <https://github.com/BobZhangHT/OCFR>.
+[Hengtao Zhang](https://bobzhanght.github.io/), Guangdong Ocean University.
+Email [zhanght@gdou.edu.cn](mailto:zhanght@gdou.edu.cn) or open a
+[GitHub issue](https://github.com/BobZhangHT/OCFR/issues).
